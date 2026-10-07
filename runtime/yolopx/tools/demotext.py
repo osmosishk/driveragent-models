@@ -33,7 +33,9 @@ import zmq
 import capnp
 
 # --- YOLOPX imports ---
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # <version>/runtime
+MODEL_DIR = os.path.dirname(BASE_DIR)                                  # <version>
+DRIVERAGENT_ROOT = os.path.expanduser(os.environ.get("DRIVERAGENT_ROOT", "~/driveragent"))
 sys.path.append(BASE_DIR)
 
 from lib.config import cfg
@@ -670,8 +672,8 @@ def main():
     parser.add_argument(
         "--weights",
         type=str,
-        default="weights/epoch-195.pth",
-        help="model .pth path",
+        default=os.path.join(MODEL_DIR, "epoch-195.pth"),
+        help="model .pth path (default: <version>/epoch-195.pth)",
     )
     parser.add_argument(
         "--socket",
@@ -741,8 +743,8 @@ def main():
     parser.add_argument(
         "--capnp-schema",
         type=str,
-        default="/home/tonyho/driveragent/message/message.capnp",
-        help="path to message.capnp",
+        default=os.path.join(DRIVERAGENT_ROOT, "message", "message.capnp"),
+        help="path to message.capnp (default: $DRIVERAGENT_ROOT/message/message.capnp)",
     )
     parser.add_argument(
         "--ctrl-sub",
