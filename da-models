@@ -12,6 +12,8 @@ Commands:
   publish <spec.yaml>           upload a new immutable version
   cache-put <model>@<version> <component> <engine>
                                 put an engine built on this device in the cache
+  cache-import <model>@<version> <engine> <record.json>
+                                upload an engine built on another device
   device                        show the device identity and engine tags
 """
 
@@ -1432,6 +1434,55 @@ def cmd_cache_put(args):
     info(f"put {engine} -> {store.url(key)}")
 
 
+TAG_RE = re.compile(r"^[a-z0-9]+-jp[0-9.]+-(trt|torch)[0-9.]+-[a-z0-9]+$")
+
+
+def cmd_cache_import(args):
+    """Upload an engine that another device built, with its build record.
+
+    The publisher host usually cannot load a foreign engine (other TensorRT
+    version or GPU), so there is no I/O check here: `build` on the device
+    checked the engine tensors before it wrote the record. This command checks
+    that the engine and the record agree with each other and with models.yaml.
+    """
+    man = load_manifest(args)
+    name, version = split_ref(args.ref)
+    if not version:
+        raise DAError("give the version: <model>@<version>")
+    entry = man.entry(name, version)
+    engine, record_path = Path(args.engine), Path(args.record)
+    rec = read_json(record_path)
+    comp = (entry.get("components") or {}).get(rec.get("component"))
+    problems = []
+    if (rec.get("model"), rec.get("version")) != (name, version):
+        problems.append(f"record is for {rec.get('model')}@{rec.get('version')}, not {name}@{version}")
+    if not comp or comp["runtime"] != "tensorrt":
+        problems.append(f"{name}@{version} has no TensorRT component '{rec.get('component')}'")
+    else:
+        if engine.name != comp["engine"]:
+            problems.append(f"engine file name {engine.name} is not {comp['engine']}")
+        if rec.get("source_sha256") != file_index(entry)[comp["source"]][1]:
+            problems.append("record source_sha256 does not agree with models.yaml")
+        if rec.get("precision") != comp.get("precision") or not str(rec.get("tag", "")).endswith("-" + comp.get("precision", "")):
+            problems.append("record precision or tag does not agree with the component precision")
+    if not TAG_RE.match(str(rec.get("tag", ""))):
+        problems.append(f"bad tag '{rec.get('tag')}'")
+    if rec.get("origin") != "trtexec":
+        problems.append(f"record origin is '{rec.get('origin')}', not 'trtexec'")
+    size, digest = engine.stat().st_size, sha256_file(engine)
+    if (rec.get("size"), rec.get("sha256")) != (size, digest):
+        problems.append("engine size or sha256 does not agree with the record")
+    if problems:
+        raise DAError("cache-import refused:\n  - " + "\n  - ".join(problems))
+    store = open_store(man, args.credentials, prefer_write=True)
+    key = engine_prefix(name, version, rec["tag"]) + engine.name
+    if store.stat(key) is not None:
+        raise Exists(f"{store.url(key)} already exists")
+    store.upload(key, engine, {"sha256": digest})
+    store.upload(key + ".json", record_path, {})
+    info(f"imported {engine} ({rec['tag']}, built on {rec.get('host')}) -> {store.url(key)}")
+
+
 def cmd_device(args):
     dev = Device()
     for k, v in dev.record().items():
@@ -1484,11 +1535,18 @@ def main(argv=None):
     s.add_argument("engine", help="engine file built on this device")
     s.add_argument("--note", help="free text kept in the engine record")
 
+    s = sub.add_parser("cache-import", parents=[common],
+                       help="upload an engine built on another device, with its build record")
+    s.add_argument("ref", help="<model>@<version>")
+    s.add_argument("engine", help="engine file copied from the device")
+    s.add_argument("record", help="its <engine>.json build record from the device")
+
     sub.add_parser("device", parents=[common], help="show the device identity")
 
     args = p.parse_args(argv)
     commands = {"list": cmd_list, "pull": cmd_pull, "build": cmd_build, "verify": cmd_verify,
-                "publish": cmd_publish, "cache-put": cmd_cache_put, "device": cmd_device}
+                "publish": cmd_publish, "cache-put": cmd_cache_put, "cache-import": cmd_cache_import,
+                "device": cmd_device}
     try:
         commands[args.cmd](args)
         return 0

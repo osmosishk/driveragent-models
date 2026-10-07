@@ -236,6 +236,29 @@ class TestBuild(Env):
         self.run_tool("pull", "tiny")
         self.assertIn("needs Python package pyyaml==0.0.1", self.run_tool("build", "tiny", ok=False))
 
+    def test_cache_import_from_other_device(self):
+        self.publish()
+        dev_env = dict(self.env, DA_DEVICE="orinnx16")
+        self.run_tool("pull", "tiny", env=dev_env)
+        self.run_tool("build", "tiny", "--no-upload", env=dev_env)
+        engine = next(self.root.glob("tiny/1.0.0/engines/orinnx16-*/tiny.engine"))
+        record = engine.with_name("tiny.engine.json")
+        # Changed engine bytes must be refused.
+        bad = self.tmp / "bad" / "tiny.engine"
+        bad.parent.mkdir()
+        bad.write_bytes(engine.read_bytes() + b"x")
+        out = self.run_tool("cache-import", "tiny@1.0.0", str(bad), str(record), ok=False)
+        self.assertIn("sha256 does not agree", out)
+        self.assertIn("imported", self.run_tool("cache-import", "tiny@1.0.0", str(engine), str(record)))
+        self.assertTrue(list(self.bucket.glob("engines/tiny/1.0.0/orinnx16-*/tiny.engine")))
+        self.assertIn("already exists", self.run_tool("cache-import", "tiny@1.0.0", str(engine), str(record), ok=False))
+        # A clean store with the same tag gets it from the cache, with no trtexec.
+        root2 = self.tmp / "store_nx2"
+        root2.mkdir()
+        env2 = dict(dev_env, DA_MODELS_ROOT=str(root2), TRTEXEC="/bin/false")
+        self.run_tool("pull", "tiny", env=env2)
+        self.assertIn("cache hit", self.run_tool("build", "tiny", env=env2))
+
     def test_build_does_not_fail_when_upload_denied(self):
         self.publish()
         root_c = self.tmp / "store_c"
