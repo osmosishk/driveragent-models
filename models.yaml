@@ -1,0 +1,10 @@
+# models.yaml - DriverAgent model registry manifest.
+#
+# `da-models publish` writes this file. By hand, change only `status`
+# (production | candidate | archived) and `description`. The files, sizes
+# and sha256 of a published version never change: a version is immutable.
+# `da-models pull <model>` selects the newest `production` version only.
+
+schema_version: 1
+bucket: gs://driveragent-model
+models: {}

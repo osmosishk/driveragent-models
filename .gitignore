@@ -1,0 +1,21 @@
+# Model binaries go to the GCS bucket, never to git (no Git LFS).
+*.onnx
+*.onnx.data
+*.engine
+*.plan
+*.trt
+*.pt
+*.pth
+*.wts
+*.cache
+*.npy
+*.npz
+*.tar.gz
+*.so
+
+# Credentials
+*.json
+!releases/*.json
+
+__pycache__/
+*.pyc

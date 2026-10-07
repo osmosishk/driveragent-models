@@ -1,0 +1,1486 @@
+#!/usr/bin/env python3
+"""da-models - DriverAgent model registry client.
+
+The model binaries are in a private GCS bucket. This repository holds the
+manifest (models.yaml), this tool and the documents. See README.md.
+
+Commands:
+  list                          show the models and versions in models.yaml
+  pull  <model>[@version]       download, check sha256, move into place
+  build <model>[@version]       get or build the engines for this device
+  verify [<model>[@version]]    check the local store (and the bucket)
+  publish <spec.yaml>           upload a new immutable version
+  cache-put <model>@<version> <component> <engine>
+                                put an engine built on this device in the cache
+  device                        show the device identity and engine tags
+"""
+
+import argparse
+import contextlib
+import datetime
+import fcntl
+import getpass
+import glob
+import gzip
+import hashlib
+import importlib.metadata
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from functools import cached_property
+from pathlib import Path
+
+import yaml
+
+SCHEMA_VERSION = 1
+STATUSES = ("production", "candidate", "archived")
+RUNTIMES = ("tensorrt", "onnxruntime-cpu", "pytorch")
+DEFAULT_ROOT = "/opt/driveragent/models"
+REPO_DIR = Path(__file__).resolve().parent
+CONFIG_DIRS = (Path.home() / ".config" / "driveragent-models", Path("/etc/driveragent-models"))
+TRTEXEC_DEFAULT = "/usr/src/tensorrt/bin/trtexec"
+RUNTIME_ARCHIVE = "runtime.tar.gz"
+RESERVED_FILES = ("model.json", RUNTIME_ARCHIVE)
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
+FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# Jetson module part number -> short device name used in engine tags.
+MODULES = {
+    "p3701-0000": "agxorin32",
+    "p3701-0004": "agxorin32",
+    "p3701-0005": "agxorin64",
+    "p3701-0008": "agxorinind",
+    "p3767-0000": "orinnx16",
+    "p3767-0001": "orinnx8",
+    "p3767-0003": "orinnano8",
+    "p3767-0004": "orinnano4",
+    "p3767-0005": "orinnano8",
+}
+# Only releases where the JetPack number is certain. Others fall back to the
+# installed or candidate nvidia-jetpack package, or to $DA_JETPACK.
+L4T_TO_JETPACK = {
+    "36.4.4": "6.2.1", "36.4.3": "6.2", "36.4.0": "6.1", "36.3.0": "6.0",
+    "35.6.0": "5.1.4", "35.5.0": "5.1.3", "35.4.1": "5.1.2",
+}
+ONNX_DTYPES = {1: "float32", 2: "uint8", 3: "int8", 5: "int16", 6: "int32", 7: "int64",
+               9: "bool", 10: "float16", 11: "float64", 16: "bfloat16"}
+
+
+class DAError(Exception):
+    pass
+
+
+class Denied(DAError):
+    pass
+
+
+class Exists(DAError):
+    pass
+
+
+class Missing(DAError):
+    pass
+
+
+def info(msg):
+    print(msg, flush=True)
+
+
+def warn(msg):
+    print(f"WARNING: {msg}", file=sys.stderr, flush=True)
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def sha256_file(path, bufsize=8 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(bufsize), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text())
+
+
+def write_json(path, data):
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def run_quiet(cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def parse_version(v):
+    m = VERSION_RE.match(str(v or ""))
+    if not m:
+        raise DAError(f"bad version '{v}': use MAJOR.MINOR.PATCH, e.g. 1.0.0")
+    major, minor, patch, pre = m.groups()
+    # A pre-release (1.0.0-rc1) sorts before its release (1.0.0).
+    return (int(major), int(minor), int(patch), 0 if pre else 1, pre or "")
+
+
+def version_ge(have, need):
+    """Loose dotted compare: '10.3.0' >= '10.3', '2.8.0+nv' >= '2.8'."""
+    def norm(s):
+        return [int(x) for x in re.findall(r"\d+", str(s).split("+")[0])]
+    a, b = norm(have), norm(need)
+    n = max(len(a), len(b))
+    return a + [0] * (n - len(a)) >= b + [0] * (n - len(b))
+
+
+def short_version(v, parts=3):
+    m = re.match(r"\d+(?:\.\d+)*", str(v))
+    return ".".join(m.group(0).split(".")[:parts]) if m else str(v)
+
+
+def python_package_problem(pkg, want):
+    """None when the installed package satisfies '==X' or '>=X', else a message."""
+    try:
+        have = importlib.metadata.version(pkg)
+    except importlib.metadata.PackageNotFoundError:
+        return f"needs Python package {pkg}{want}; it is not installed"
+    m = re.match(r"^(==|>=)\s*(\S+)$", str(want))
+    if not m:
+        raise DAError(f"requires.python.{pkg}: use '==X' or '>=X', not '{want}'")
+    op, ver = m.groups()
+    ok = short_version(have) == short_version(ver) if op == "==" else version_ge(have, ver)
+    return None if ok else f"needs Python package {pkg}{want}; this device has {have}"
+
+
+def split_ref(ref):
+    name, _, ver = ref.partition("@")
+    if not NAME_RE.match(name):
+        raise DAError(f"bad model name '{name}'")
+    if ver:
+        parse_version(ver)
+    return name, ver or None
+
+
+# --------------------------------------------------------------------------
+# Manifest (models.yaml)
+# --------------------------------------------------------------------------
+
+MANIFEST_HEADER = """\
+# models.yaml - DriverAgent model registry manifest.
+#
+# `da-models publish` writes this file. By hand, change only `status`
+# (production | candidate | archived) and `description`. The files, sizes
+# and sha256 of a published version never change: a version is immutable.
+# `da-models pull <model>` selects the newest `production` version only.
+"""
+
+
+class _Dumper(yaml.SafeDumper):
+    pass
+
+
+def _represent_list(dumper, data):
+    flow = len(data) <= 8 and all(isinstance(x, (int, float, str)) and len(str(x)) < 40 for x in data)
+    return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=flow)
+
+
+_Dumper.add_representer(list, _represent_list)
+
+
+def yaml_dump(data):
+    return yaml.dump(data, Dumper=_Dumper, sort_keys=False, default_flow_style=False, width=100)
+
+
+class Manifest:
+    def __init__(self, path):
+        self.path = Path(path)
+        if not self.path.is_file():
+            raise DAError(f"manifest not found: {self.path}")
+        data = yaml.safe_load(self.path.read_text()) or {}
+        if data.get("schema_version") != SCHEMA_VERSION:
+            raise DAError(f"{self.path}: schema_version must be {SCHEMA_VERSION}")
+        if not data.get("models"):
+            data["models"] = {}
+        self.data = data
+
+    @property
+    def bucket(self):
+        return self.data.get("bucket")
+
+    @property
+    def models(self):
+        return self.data["models"]
+
+    def model(self, name):
+        m = self.models.get(name)
+        if m is None:
+            raise Missing(f"model '{name}' is not in {self.path}")
+        return m
+
+    def versions(self, name):
+        return self.model(name).get("versions") or {}
+
+    def entry(self, name, version):
+        vs = self.versions(name)
+        if version not in vs:
+            raise Missing(f"{name}@{version} is not in {self.path}")
+        return vs[version]
+
+    def select(self, name, version=None):
+        """Explicit version, or the newest production version."""
+        if version:
+            return version, self.entry(name, version)
+        vs = self.versions(name)
+        prod = [v for v, e in vs.items() if e.get("status") == "production"]
+        if not prod:
+            listed = ", ".join(f"{v} ({e.get('status')})" for v, e in
+                               sorted(vs.items(), key=lambda kv: parse_version(kv[0]))) or "none"
+            raise Missing(f"{name} has no production version. Give the version: "
+                          f"da-models pull {name}@<version>. Versions: {listed}")
+        v = max(prod, key=parse_version)
+        return v, vs[v]
+
+    def add(self, name, version, entry, description=None):
+        m = self.models.setdefault(name, {})
+        if description and not m.get("description"):
+            m["description"] = description
+        vs = m.setdefault("versions", {}) or {}
+        m["versions"] = vs
+        if version in vs:
+            raise Exists(f"{name}@{version} is already in {self.path}")
+        vs[version] = entry
+        m["versions"] = dict(sorted(vs.items(), key=lambda kv: parse_version(kv[0])))
+
+    def save(self):
+        tmp = self.path.with_name(f".{self.path.name}.tmp")
+        tmp.write_text(MANIFEST_HEADER + "\n" + yaml_dump(self.data))
+        os.replace(tmp, self.path)
+
+
+def load_manifest(args):
+    path = args.manifest or os.environ.get("DA_MODELS_MANIFEST") or REPO_DIR / "models.yaml"
+    return Manifest(path)
+
+
+def file_index(entry):
+    return {f["name"]: (f["size"], f["sha256"]) for f in entry.get("files", [])}
+
+
+def check_same_files(a, b, what):
+    if file_index(a) != file_index(b):
+        raise DAError(f"{what}: the file list (names, sizes, sha256) does not agree with models.yaml")
+
+
+# --------------------------------------------------------------------------
+# Bucket backends
+# --------------------------------------------------------------------------
+
+class LocalStore:
+    """file:// bucket for tests and offline use. Same create-only rule as GCS."""
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.identity = f"{getpass.getuser()}@{socket.gethostname()}"
+
+    def url(self, key):
+        return f"file://{self.root}/{key}"
+
+    def _meta(self, key):
+        return self.root / ".meta" / (key + ".json")
+
+    def stat(self, key):
+        p = self.root / key
+        if not p.is_file():
+            return None
+        meta = read_json(self._meta(key)) if self._meta(key).is_file() else {}
+        return {"size": p.stat().st_size, "metadata": meta}
+
+    def list(self, prefix):
+        if not self.root.is_dir():
+            return []
+        out = []
+        for p in self.root.rglob("*"):
+            rel = p.relative_to(self.root)
+            if p.is_file() and rel.parts[0] != ".meta" and str(rel).startswith(prefix):
+                out.append(str(rel))
+        return sorted(out)
+
+    def download(self, key, dest):
+        p = self.root / key
+        if not p.is_file():
+            raise Missing(f"not found: {self.url(key)}")
+        try:
+            shutil.copyfile(p, dest)
+        except PermissionError as e:
+            raise Denied(f"permission denied: {self.url(key)}") from e
+
+    def upload(self, key, src, metadata=None):
+        dest = self.root / key
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+            shutil.copyfile(src, tmp)
+            try:
+                os.link(tmp, dest)  # fails when dest exists: create-only
+            except FileExistsError:
+                raise Exists(f"already exists (immutable): {self.url(key)}") from None
+            finally:
+                tmp.unlink(missing_ok=True)
+            meta = self._meta(key)
+            meta.parent.mkdir(parents=True, exist_ok=True)
+            meta.write_text(json.dumps(metadata or {}))
+        except PermissionError as e:
+            raise Denied(f"permission denied: {self.url(key)}") from e
+
+
+class GCSStore:
+    def __init__(self, bucket, credentials):
+        try:
+            from google.api_core import exceptions as gexc
+            from google.cloud import storage
+        except ImportError as e:
+            raise DAError("google-cloud-storage is not installed: pip3 install google-cloud-storage") from e
+        self._gexc = gexc
+        if credentials:
+            client = storage.Client.from_service_account_json(str(credentials))
+            self.identity = read_json(credentials).get("client_email", str(credentials))
+        else:
+            client = storage.Client()
+            self.identity = "application-default-credentials"
+        # Do not call bucket.reload(): the read-only role has no storage.buckets.get.
+        self.bucket = client.bucket(bucket)
+        self.name = bucket
+
+    def url(self, key):
+        return f"gs://{self.name}/{key}"
+
+    @contextlib.contextmanager
+    def _errors(self, key):
+        x = self._gexc
+        try:
+            yield
+        except (x.Forbidden, x.Unauthorized) as e:
+            raise Denied(f"permission denied: {self.url(key)}") from e
+        except x.NotFound as e:
+            raise Missing(f"not found: {self.url(key)}") from e
+        except x.PreconditionFailed as e:
+            raise Exists(f"already exists (immutable): {self.url(key)}") from e
+
+    def stat(self, key):
+        with self._errors(key):
+            b = self.bucket.get_blob(key)
+        return None if b is None else {"size": b.size, "metadata": dict(b.metadata or {})}
+
+    def list(self, prefix):
+        with self._errors(prefix):
+            return sorted(b.name for b in self.bucket.list_blobs(prefix=prefix))
+
+    def download(self, key, dest):
+        with self._errors(key):
+            self.bucket.blob(key).download_to_filename(str(dest), timeout=900)
+
+    def upload(self, key, src, metadata=None):
+        blob = self.bucket.blob(key, chunk_size=32 << 20)
+        blob.metadata = metadata or {}
+        with self._errors(key):
+            # if_generation_match=0: create only, never overwrite.
+            blob.upload_from_filename(str(src), if_generation_match=0, timeout=900)
+
+
+def find_credentials(explicit=None, prefer_write=False):
+    for c in (explicit, os.environ.get("DA_MODELS_CREDENTIALS")):
+        if c:
+            p = Path(c).expanduser()
+            if not p.is_file():
+                raise DAError(f"credential file not found: {p}")
+            return p
+    names = ("publisher.json", "reader.json") if prefer_write else ("reader.json", "publisher.json")
+    for d in CONFIG_DIRS:
+        for n in names:
+            if (d / n).is_file():
+                return d / n
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        return None
+    raise DAError("no credential found. Put the key at ~/.config/driveragent-models/reader.json "
+                  "(publisher.json on the publisher host), or set DA_MODELS_CREDENTIALS")
+
+
+def open_store(manifest, credentials=None, prefer_write=False):
+    url = os.environ.get("DA_MODELS_BUCKET") or manifest.bucket
+    if not url:
+        raise DAError("no bucket: set `bucket:` in models.yaml")
+    if url.startswith("file://"):
+        return LocalStore(url[len("file://"):])
+    if not url.startswith("gs://"):
+        raise DAError(f"bad bucket url '{url}': use gs://<bucket>")
+    return GCSStore(url[len("gs://"):].strip("/"), find_credentials(credentials, prefer_write))
+
+
+def model_prefix(name, version):
+    return f"models/{name}/{version}/"
+
+
+def engine_prefix(name, version, tag):
+    return f"engines/{name}/{version}/{tag}/"
+
+
+# --------------------------------------------------------------------------
+# Device identity
+# --------------------------------------------------------------------------
+
+class Device:
+    @cached_property
+    def module(self):
+        if os.environ.get("DA_DEVICE"):
+            return os.environ["DA_DEVICE"]
+        try:
+            compat = Path("/proc/device-tree/compatible").read_bytes().split(b"\0")
+        except OSError:
+            raise DAError("cannot read /proc/device-tree/compatible; set DA_DEVICE (e.g. orinnx16)") from None
+        for c in compat:
+            m = re.search(r"(p37\d\d-\d{4})$", c.decode(errors="ignore"))
+            if m and m.group(1) in MODULES:
+                return MODULES[m.group(1)]
+        raise DAError(f"unknown Jetson module {[c.decode(errors='ignore') for c in compat if c]}; set DA_DEVICE")
+
+    @cached_property
+    def l4t(self):
+        try:
+            txt = Path("/etc/nv_tegra_release").read_text()
+        except OSError:
+            return "unknown"
+        m = re.search(r"R(\d+) \(release\), REVISION: (\d+)\.(\d+)", txt)
+        return ".".join(m.groups()) if m else "unknown"
+
+    @cached_property
+    def jetpack(self):
+        if os.environ.get("DA_JETPACK"):
+            return os.environ["DA_JETPACK"]
+        installed = run_quiet(["dpkg-query", "-W", "-f=${Status} ${Version}", "nvidia-jetpack"])
+        if installed.startswith("install ok installed"):
+            return short_version(installed.split()[-1])
+        if self.l4t in L4T_TO_JETPACK:
+            return L4T_TO_JETPACK[self.l4t]
+        m = re.search(r"Candidate:\s*(\d[\w.+-]*)", run_quiet(["apt-cache", "policy", "nvidia-jetpack"]))
+        if m:
+            return short_version(m.group(1))
+        raise DAError(f"cannot find the JetPack version for L4T {self.l4t}; set DA_JETPACK")
+
+    @cached_property
+    def trt(self):
+        with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+            return short_version(importlib.metadata.version("tensorrt"))
+        with contextlib.suppress(ImportError):
+            import tensorrt
+            return short_version(tensorrt.__version__)
+        v = run_quiet(["dpkg-query", "-W", "-f=${Version}", "libnvinfer10"])
+        if v:
+            return short_version(v)
+        raise DAError("TensorRT is not installed")
+
+    @cached_property
+    def torch(self):
+        for pkg in ("torch",):
+            with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+                return short_version(importlib.metadata.version(pkg))
+        raise DAError("PyTorch is not installed")
+
+    @cached_property
+    def onnxruntime(self):
+        for pkg in ("onnxruntime", "onnxruntime-gpu"):
+            with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+                return short_version(importlib.metadata.version(pkg))
+        raise DAError("onnxruntime is not installed: pip3 install onnxruntime")
+
+    @cached_property
+    def cuda(self):
+        with contextlib.suppress(OSError, ValueError, KeyError):
+            return read_json("/usr/local/cuda/version.json")["cuda"]["version"]
+        return "unknown"
+
+    def tag_for(self, comp):
+        rt, prec = comp["runtime"], comp.get("precision", "fp32")
+        if rt == "tensorrt":
+            return f"{self.module}-jp{self.jetpack}-trt{self.trt}-{prec}"
+        if rt == "pytorch":
+            return f"{self.module}-jp{self.jetpack}-torch{self.torch}-{prec}"
+        return None
+
+    def record(self):
+        out = {"device": self.module, "l4t": self.l4t, "jetpack": self.jetpack, "cuda": self.cuda}
+        for key in ("trt", "torch", "onnxruntime"):
+            with contextlib.suppress(DAError):
+                out["tensorrt" if key == "trt" else key] = getattr(self, key)
+        return out
+
+
+# --------------------------------------------------------------------------
+# Tensor I/O checks
+# --------------------------------------------------------------------------
+
+def onnx_io(path):
+    try:
+        import onnx
+    except ImportError as e:
+        raise DAError("publish needs the onnx package: pip3 install onnx") from e
+    m = onnx.load(str(path), load_external_data=False)
+    inits = {i.name for i in m.graph.initializer}
+
+    def conv(v):
+        t = v.type.tensor_type
+        shape = [d.dim_value if d.HasField("dim_value") else (d.dim_param or "?") for d in t.shape.dim]
+        return {"name": v.name, "shape": shape, "dtype": ONNX_DTYPES.get(t.elem_type, str(t.elem_type))}
+
+    return [conv(v) for v in m.graph.input if v.name not in inits], [conv(v) for v in m.graph.output]
+
+
+def wanted_io(comp):
+    want = {t["name"]: ("input", t["shape"]) for t in comp.get("inputs", [])}
+    want.update({t["name"]: ("output", t["shape"]) for t in comp.get("outputs", [])})
+    return want
+
+
+def engine_io(path):
+    try:
+        import tensorrt as trt
+    except ImportError as e:
+        raise DAError("python3-libnvinfer (tensorrt) is not installed") from e
+    logger = trt.Logger(trt.Logger.ERROR)
+    trt.init_libnvinfer_plugins(logger, "")
+    engine = trt.Runtime(logger).deserialize_cuda_engine(Path(path).read_bytes())
+    if engine is None:
+        raise DAError(f"{path}: TensorRT cannot load this engine here (other device or TensorRT version?)")
+    have = {}
+    for i in range(engine.num_io_tensors):
+        n = engine.get_tensor_name(i)
+        mode = "input" if engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT else "output"
+        have[n] = (mode, [int(d) for d in engine.get_tensor_shape(n)])
+    del engine
+    return have
+
+
+def check_engine_io(path, comp):
+    have, want = engine_io(path), wanted_io(comp)
+    if set(have) != set(want):
+        raise DAError(f"{path}: engine tensors {sorted(have)} do not agree with models.yaml {sorted(want)}")
+    for n, (mode, shape) in want.items():
+        hmode, hshape = have[n]
+        if hmode != mode:
+            raise DAError(f"{path}: tensor {n} is an {hmode} in the engine, an {mode} in models.yaml")
+        if len(hshape) != len(shape) or any(
+                isinstance(w, int) and h != -1 and h != w for h, w in zip(hshape, shape)):
+            raise DAError(f"{path}: tensor {n} shape {hshape} does not agree with models.yaml {shape}")
+
+
+def check_ort(path, comp):
+    try:
+        import onnxruntime as ort
+    except ImportError as e:
+        raise DAError("onnxruntime is not installed: pip3 install onnxruntime") from e
+    s = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    have = {i.name: "input" for i in s.get_inputs()}
+    have.update({o.name: "output" for o in s.get_outputs()})
+    want = {n: mode for n, (mode, _) in wanted_io(comp).items()}
+    if have != want:
+        raise DAError(f"{path}: onnxruntime tensors {have} do not agree with models.yaml {want}")
+
+
+# --------------------------------------------------------------------------
+# Local store
+# --------------------------------------------------------------------------
+
+def store_root(args):
+    return Path(args.root or os.environ.get("DA_MODELS_ROOT") or DEFAULT_ROOT)
+
+
+@contextlib.contextmanager
+def locked_root(root):
+    if not root.is_dir():
+        raise DAError(f"model store {root} does not exist. Make it one time: "
+                      f"sudo install -d -o $USER -g $USER {root}")
+    if not os.access(root, os.W_OK):
+        raise DAError(f"no write permission on {root}")
+    (root / ".tmp").mkdir(exist_ok=True)
+    with open(root / ".lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            info(f"waiting for another da-models process on {root} ...")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        yield root
+
+
+def current_version(root, name):
+    link = root / name / "current"
+    return os.readlink(link) if link.is_symlink() else None
+
+
+def set_current(root, name, version):
+    link = root / name / "current"
+    tmp = root / name / f".current.{os.getpid()}"
+    tmp.unlink(missing_ok=True)
+    os.symlink(version, tmp)
+    os.replace(tmp, link)  # atomic switch
+
+
+def local_versions(root, name):
+    d = root / name
+    if not d.is_dir():
+        return []
+    out = [p.name for p in d.iterdir() if p.is_dir() and not p.is_symlink() and VERSION_RE.match(p.name)]
+    return sorted(out, key=parse_version)
+
+
+def check_file(path, f):
+    size = path.stat().st_size
+    if size != f["size"]:
+        raise DAError(f"{f['name']}: size {size} is not {f['size']}")
+    digest = sha256_file(path)
+    if digest != f["sha256"]:
+        raise DAError(f"{f['name']}: sha256 {digest} is not {f['sha256']}")
+
+
+def extract_tar(tar_path, dest):
+    with tarfile.open(tar_path, "r:*") as t:
+        t.extractall(dest, filter="data")
+
+
+def check_runtime_tree(vdir, archive):
+    """Compare the extracted runtime code with the archive members."""
+    problems = []
+    with tarfile.open(archive, "r:*") as t:
+        for m in t.getmembers():
+            if not m.isfile():
+                continue
+            p = vdir / m.name
+            if not p.is_file():
+                problems.append(f"runtime file missing: {m.name}")
+            elif hashlib.sha256(t.extractfile(m).read()).hexdigest() != sha256_file(p):
+                problems.append(f"runtime file changed: {m.name}")
+    return problems
+
+
+def check_version_dir(vdir, quick=False):
+    """Return the problems of a pulled version directory (empty list = good)."""
+    rec = vdir / "model.json"
+    if not rec.is_file():
+        return [f"{rec} is missing"]
+    entry = read_json(rec)["entry"]
+    problems = []
+    for f in entry["files"]:
+        p = vdir / f["name"]
+        if not p.is_file():
+            problems.append(f"file missing: {f['name']}")
+        elif p.stat().st_size != f["size"]:
+            problems.append(f"size mismatch: {f['name']}")
+        elif not quick and sha256_file(p) != f["sha256"]:
+            problems.append(f"sha256 mismatch: {f['name']}")
+    rt = entry.get("runtime")
+    if rt and not quick and (vdir / rt["file"]).is_file():
+        problems += check_runtime_tree(vdir, vdir / rt["file"])
+    return problems
+
+
+# --------------------------------------------------------------------------
+# list
+# --------------------------------------------------------------------------
+
+def cmd_list(args):
+    man = load_manifest(args)
+    root = store_root(args)
+    rows = [("MODEL", "VERSION", "STATUS", "SIZE", "LOCAL")]
+    for name in sorted(man.models):
+        cur = current_version(root, name) if root.is_dir() else None
+        for v, e in sorted(man.versions(name).items(), key=lambda kv: parse_version(kv[0]), reverse=True):
+            local = ""
+            if (root / name / v).is_dir():
+                local = "pulled, current" if v == cur else "pulled"
+            size = human(sum(f["size"] for f in e.get("files", [])))
+            rows.append((name, v, e.get("status", "?"), size, local))
+    if len(rows) == 1:
+        info("models.yaml has no models.")
+        return
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        info("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
+    info("\n`pull <model>` selects the newest production version. "
+         "Give <model>@<version> for a candidate or archived version.")
+
+
+# --------------------------------------------------------------------------
+# pull
+# --------------------------------------------------------------------------
+
+def pull_version(store, root, name, version, entry):
+    files = entry["files"]
+    need = sum(f["size"] for f in files)
+    free = shutil.disk_usage(root).free
+    if free < need * 1.2 + (512 << 20):
+        raise DAError(f"not enough disk space in {root}: need about {human(need * 1.2)}, free {human(free)}")
+    prefix = model_prefix(name, version)
+    tmp = Path(tempfile.mkdtemp(prefix=f"{name}-{version}-", dir=root / ".tmp"))
+    try:
+        # publish writes model.json last, so it proves that the upload is complete.
+        remote = tmp / ".remote-model.json"
+        store.download(prefix + "model.json", remote)
+        check_same_files(entry, read_json(remote)["entry"], f"{store.url(prefix + 'model.json')}")
+        remote.unlink()
+        for f in files:
+            info(f"  get   {f['name']} ({human(f['size'])})")
+            dst = tmp / f["name"]
+            store.download(prefix + f["name"], dst)
+            check_file(dst, f)
+            info(f"  ok    sha256 {f['sha256'][:16]}...")
+        rt = entry.get("runtime")
+        if rt:
+            extract_tar(tmp / rt["file"], tmp)
+        write_json(tmp / "model.json", {"name": name, "version": version, "bucket": store.url(""),
+                                        "pulled_at": now_utc(), "entry": entry})
+        (root / name).mkdir(exist_ok=True)
+        os.rename(tmp, root / name / version)  # atomic on the same file system
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def cmd_pull(args):
+    man = load_manifest(args)
+    name, ver = split_ref(args.ref)
+    version, entry = man.select(name, ver)
+    status = entry.get("status")
+    root = store_root(args)
+    with locked_root(root):
+        dest = root / name / version
+        if dest.is_dir():
+            problems = check_version_dir(dest, quick=True)
+            if problems:
+                raise DAError(f"{dest} exists but is not complete ({problems[0]}). "
+                              f"Move it away, then pull again.")
+            check_same_files(entry, read_json(dest / "model.json")["entry"], str(dest))
+            info(f"{name}@{version} ({status}) is already in {dest}")
+        else:
+            store = open_store(man, args.credentials)
+            info(f"pull {name}@{version} ({status}) from {store.url(model_prefix(name, version))}")
+            pull_version(store, root, name, version, entry)
+            info(f"{name}@{version} is in {dest}")
+        if args.set_current or (status == "production" and not args.no_current):
+            set_current(root, name, version)
+            info(f"{root / name / 'current'} -> {version}")
+        else:
+            info(f"`current` not changed: {name}@{version} is {status}. Use --set-current to select it.")
+
+
+# --------------------------------------------------------------------------
+# build
+# --------------------------------------------------------------------------
+
+def deterministic_targz(out, members):
+    """Write (arcname, path) pairs to a .tar.gz with fixed metadata."""
+    with open(out, "wb") as fo, gzip.GzipFile(filename="", mode="wb", fileobj=fo, mtime=0) as gz, \
+            tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as t:
+        for arcname, path in sorted(members):
+            ti = tarfile.TarInfo(arcname)
+            ti.size = Path(path).stat().st_size
+            ti.mode = 0o755 if os.access(path, os.X_OK) else 0o644
+            with open(path, "rb") as f:
+                t.addfile(ti, f)
+
+
+class Builder:
+    def __init__(self, args, man, root, name, version, vdir, entry):
+        self.args, self.man, self.root = args, man, root
+        self.name, self.version, self.vdir, self.entry = name, version, vdir, entry
+        self.dev = Device()
+        self._store = None
+        self._store_failed = False
+        self.results = []
+
+    def store(self):
+        if self._store is None and not self._store_failed:
+            try:
+                self._store = open_store(self.man, self.args.credentials, prefer_write=True)
+            except DAError as e:
+                warn(f"engine cache not available ({e}). Build without the cache.")
+                self._store_failed = True
+        return self._store
+
+    def source_sha(self, comp):
+        return file_index(self.entry)[comp["source"]][1]
+
+    def check_requirements(self):
+        req = self.entry.get("requires") or {}
+        runtimes = {c["runtime"] for c in self.entry.get("components", {}).values()}
+        checks = [("jetpack_min", "JetPack", lambda: self.dev.jetpack, True)]
+        checks.append(("tensorrt_min", "TensorRT", lambda: self.dev.trt, "tensorrt" in runtimes))
+        checks.append(("torch_min", "PyTorch", lambda: self.dev.torch, "pytorch" in runtimes))
+        checks.append(("onnxruntime_min", "onnxruntime", lambda: self.dev.onnxruntime,
+                       "onnxruntime-cpu" in runtimes))
+        for key, label, have, needed in checks:
+            if needed and req.get(key) and not version_ge(have(), req[key]):
+                raise DAError(f"{self.name}@{self.version} needs {label} >= {req[key]}; this device has {have()}")
+        for pkg, want in (req.get("python") or {}).items():
+            problem = python_package_problem(pkg, want)
+            if problem:
+                raise DAError(f"{self.name}@{self.version}: {problem}")
+
+    def upload_if_missing(self, cname, key, artifact, meta_path):
+        """Upload a verified local result that the cache does not have yet.
+
+        Only results made on this device (origin trtexec/build) are uploaded;
+        this lets a publisher build with --no-upload, compare, then upload.
+        """
+        if self.args.no_upload or read_json(meta_path).get("origin") not in ("trtexec", "build"):
+            return ""
+        store = self.store()
+        if store is None:
+            return ""
+        try:
+            if store.stat(key) is not None:
+                return ""
+        except DAError as e:
+            warn(f"[{cname}] cannot check the cache: {e}")
+            return ""
+        return ", " + self.upload(cname, key, artifact, meta_path, read_json(meta_path)["sha256"])
+
+    def upload(self, cname, key, artifact, meta_path, digest):
+        store = self.store()
+        if store is None or self.args.no_upload:
+            return "not uploaded"
+        try:
+            store.upload(key, artifact, {"sha256": digest})
+            store.upload(key + ".json", meta_path, {})
+            info(f"[{cname}] uploaded to {store.url(key)}")
+            return "uploaded"
+        except Denied:
+            info(f"[{cname}] upload not permitted with this credential (read-only). "
+                 f"The result stays on this device only.")
+            return "upload not permitted"
+        except Exists:
+            info(f"[{cname}] the cache already has a result for this tag. The local result is kept.")
+            return "cache already set"
+        except Exception as e:  # network errors must not fail the build
+            warn(f"[{cname}] upload failed: {e}")
+            if self.args.require_upload:
+                raise DAError(f"[{cname}] upload failed and --require-upload is set") from e
+            return "upload failed"
+
+    def fetch(self, cname, key, dest, meta_dest, check):
+        """Get one cached artifact. Return True when it is in place."""
+        store = self.store()
+        if store is None or self.args.no_cache or self.args.rebuild:
+            return False
+        try:
+            if store.stat(key) is None:
+                info(f"[{cname}] cache miss: {store.url(key)}")
+                return False
+            tmpd = Path(tempfile.mkdtemp(dir=self.root / ".tmp"))
+            try:
+                art, meta = tmpd / dest.name, tmpd / meta_dest.name
+                info(f"[{cname}] cache hit: {store.url(key)}")
+                store.download(key, art)
+                store.download(key + ".json", meta)
+                m = read_json(meta)
+                if sha256_file(art) != m.get("sha256"):
+                    raise DAError("sha256 does not agree with its record")
+                check(art, m)
+                os.replace(art, dest)
+                os.replace(meta, meta_dest)
+            finally:
+                shutil.rmtree(tmpd, ignore_errors=True)
+            return True
+        except DAError as e:
+            warn(f"[{cname}] cannot use the cache entry ({e}). Build on this device.")
+            return False
+
+    def meta(self, cname, comp, tag, digest, size, origin, extra=None):
+        m = {"model": self.name, "version": self.version, "component": cname, "tag": tag,
+             "runtime": comp["runtime"], "precision": comp.get("precision"),
+             "source": comp["source"], "source_sha256": self.source_sha(comp),
+             "sha256": digest, "size": size, "origin": origin, "host": socket.gethostname(),
+             "created_at": now_utc(), **self.dev.record()}
+        m.update(extra or {})
+        return m
+
+    # TensorRT --------------------------------------------------------------
+    def build_trt(self, cname, comp):
+        tag = self.dev.tag_for(comp)
+        edir = self.vdir / "engines" / tag
+        engine = edir / comp["engine"]
+        meta_path = edir / (comp["engine"] + ".json")
+        key = engine_prefix(self.name, self.version, tag) + comp["engine"]
+        if engine.is_file() and meta_path.is_file() and not self.args.rebuild:
+            if read_json(meta_path).get("sha256") == sha256_file(engine):
+                info(f"[{cname}] ok: local engine {engine}")
+                return "local" + self.upload_if_missing(cname, key, engine, meta_path)
+            warn(f"[{cname}] local engine does not agree with its record. Get it again.")
+        edir.mkdir(parents=True, exist_ok=True)
+
+        def check(art, m):
+            if m.get("tag") != tag or m.get("source_sha256") != self.source_sha(comp):
+                raise DAError("record is for another tag or source")
+            check_engine_io(art, comp)
+
+        if self.fetch(cname, key, engine, meta_path, check):
+            return "cache"
+
+        trtexec = os.environ.get("TRTEXEC", TRTEXEC_DEFAULT)
+        if not os.access(trtexec, os.X_OK):
+            raise DAError(f"trtexec not found at {trtexec} (set TRTEXEC)")
+        tmp = edir / f".{comp['engine']}.{os.getpid()}.tmp"
+        log = edir / (comp["engine"] + ".build.log")
+        flags = shlex.split(comp.get("trtexec_flags", ""))
+        cmd = [trtexec, f"--onnx={self.vdir / comp['source']}", f"--saveEngine={tmp}", *flags]
+        info(f"[{cname}] build: {' '.join(shlex.quote(c) for c in cmd)}")
+        t0 = time.time()
+        with open(log, "w") as lf:
+            rc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT).returncode
+        if rc != 0 or not tmp.is_file():
+            tmp.unlink(missing_ok=True)
+            tail = "".join(log.read_text(errors="replace").splitlines(True)[-15:])
+            raise DAError(f"[{cname}] trtexec failed (exit {rc}). Log: {log}\n{tail}")
+        check_engine_io(tmp, comp)
+        digest = sha256_file(tmp)
+        m = self.meta(cname, comp, tag, digest, tmp.stat().st_size, "trtexec",
+                      {"trtexec_flags": comp.get("trtexec_flags", ""), "build_seconds": round(time.time() - t0, 1)})
+        os.replace(tmp, engine)
+        write_json(meta_path, m)
+        info(f"[{cname}] built {engine} in {m['build_seconds']} s")
+        return "built, " + self.upload(cname, key, engine, meta_path, digest)
+
+    # PyTorch extensions ----------------------------------------------------
+    def build_torch(self, cname, comp):
+        b = comp.get("build")
+        if not b:
+            info(f"[{cname}] ok: PyTorch {self.dev.torch}, nothing to build")
+            return "no build"
+        tag = self.dev.tag_for(comp)
+        edir = self.vdir / "engines" / tag
+        bundle = edir / b["cache_file"]
+        meta_path = edir / (b["cache_file"] + ".json")
+        bdir = self.vdir / b["dir"]
+
+        def present():
+            return all(glob.glob(str(bdir / pat)) for pat in b["artifacts"])
+
+        key = engine_prefix(self.name, self.version, tag) + b["cache_file"]
+        if bundle.is_file() and meta_path.is_file() and present() and not self.args.rebuild:
+            if read_json(meta_path).get("sha256") == sha256_file(bundle):
+                info(f"[{cname}] ok: local build {bundle}")
+                return "local" + self.upload_if_missing(cname, key, bundle, meta_path)
+        edir.mkdir(parents=True, exist_ok=True)
+
+        def check(art, m):
+            if m.get("tag") != tag or m.get("source_sha256") != self.source_sha(comp):
+                raise DAError("record is for another tag or source")
+            extract_tar(art, bdir)
+            self.import_check(cname, bdir, b)
+
+        if self.fetch(cname, key, bundle, meta_path, check):
+            return "cache"
+
+        log = edir / (b["cache_file"] + ".build.log")
+        info(f"[{cname}] build in {bdir}: {b['command']}")
+        t0 = time.time()
+        with open(log, "w") as lf:
+            rc = subprocess.run(shlex.split(b["command"]), cwd=bdir, stdout=lf, stderr=subprocess.STDOUT).returncode
+        if rc != 0:
+            tail = "".join(log.read_text(errors="replace").splitlines(True)[-15:])
+            raise DAError(f"[{cname}] build failed (exit {rc}). Log: {log}\n{tail}")
+        members = []
+        for pat in b["artifacts"]:
+            found = sorted(glob.glob(str(bdir / pat)))
+            if not found:
+                raise DAError(f"[{cname}] build made no file for '{pat}'. Log: {log}")
+            members += [(os.path.relpath(p, bdir), p) for p in found]
+        self.import_check(cname, bdir, b)
+        tmp = edir / f".{b['cache_file']}.{os.getpid()}.tmp"
+        deterministic_targz(tmp, members)
+        digest = sha256_file(tmp)
+        m = self.meta(cname, comp, tag, digest, tmp.stat().st_size, "build",
+                      {"command": b["command"], "artifacts": [a for a, _ in members],
+                       "build_seconds": round(time.time() - t0, 1)})
+        os.replace(tmp, bundle)
+        write_json(meta_path, m)
+        info(f"[{cname}] built {len(members)} file(s) in {m['build_seconds']} s")
+        return "built, " + self.upload(cname, key, bundle, meta_path, digest)
+
+    def import_check(self, cname, bdir, b):
+        """Load each built extension with torch to prove the ABI is correct."""
+        code = ("import importlib.util, sys, torch\n"
+                "for p in sys.argv[1:]:\n"
+                "    s = importlib.util.spec_from_file_location(p.rsplit('/', 1)[-1].split('.')[0], p)\n"
+                "    s.loader.exec_module(importlib.util.module_from_spec(s))\n")
+        libs = [p for pat in b["artifacts"] for p in glob.glob(str(bdir / pat)) if p.endswith(".so")]
+        if not libs:
+            return
+        r = subprocess.run([sys.executable, "-c", code, *libs], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise DAError(f"[{cname}] built extension does not load: {r.stderr.strip().splitlines()[-1:]}")
+
+    # onnxruntime -----------------------------------------------------------
+    def check_ort(self, cname, comp):
+        check_ort(self.vdir / comp["source"], comp)
+        info(f"[{cname}] ok: onnxruntime {self.dev.onnxruntime} (CPU), nothing to build")
+        return "no build"
+
+    def run(self, only=None):
+        self.check_requirements()
+        comps = self.entry.get("components", {})
+        if only and only not in comps:
+            raise DAError(f"{self.name}@{self.version} has no component '{only}' (has: {', '.join(comps)})")
+        for cname, comp in comps.items():
+            if only and cname != only:
+                continue
+            fn = {"tensorrt": self.build_trt, "pytorch": self.build_torch,
+                  "onnxruntime-cpu": self.check_ort}[comp["runtime"]]
+            self.results.append((cname, comp["runtime"], self.dev.tag_for(comp) or "-", fn(cname, comp)))
+        info("")
+        for r in self.results:
+            info(f"  {r[0]:<16} {r[1]:<16} {r[2]:<40} {r[3]}")
+
+
+def cmd_build(args):
+    man = load_manifest(args)
+    name, ver = split_ref(args.ref)
+    root = store_root(args)
+    with locked_root(root):
+        version = ver or current_version(root, name)
+        if not version:
+            raise DAError(f"{name} has no current version. Run: da-models pull {name}")
+        vdir = root / name / version
+        if not vdir.is_dir():
+            raise DAError(f"{name}@{version} is not pulled. Run: da-models pull {name}@{version}")
+        problems = check_version_dir(vdir, quick=True)
+        if problems:
+            raise DAError(f"{vdir}: {problems[0]}. Run: da-models verify {name}@{version}")
+        entry = read_json(vdir / "model.json")["entry"]
+        try:
+            check_same_files(man.entry(name, version), entry, str(vdir))
+        except Missing:
+            warn(f"{name}@{version} is not in models.yaml (old clone?). Use the local record.")
+        info(f"build {name}@{version} for {Device().module}")
+        Builder(args, man, root, name, version, vdir, entry).run(args.only)
+
+
+# --------------------------------------------------------------------------
+# verify
+# --------------------------------------------------------------------------
+
+def verify_local(man, root, name, version, deep):
+    vdir = root / name / version
+    problems = check_version_dir(vdir)
+    entry = read_json(vdir / "model.json")["entry"] if (vdir / "model.json").is_file() else {}
+    if entry:
+        try:
+            check_same_files(man.entry(name, version), entry, str(vdir))
+        except Missing:
+            info(f"  note: {name}@{version} is not in models.yaml")
+        except DAError as e:
+            problems.append(str(e))
+    dev = Device()
+    for cname, comp in entry.get("components", {}).items():
+        rt = comp["runtime"]
+        if rt == "onnxruntime-cpu":
+            if deep:
+                try:
+                    check_ort(vdir / comp["source"], comp)
+                except DAError as e:
+                    problems.append(str(e))
+            continue
+        if rt == "pytorch" and not comp.get("build"):
+            continue
+        tag = dev.tag_for(comp)
+        art_name = comp["engine"] if rt == "tensorrt" else comp["build"]["cache_file"]
+        art = vdir / "engines" / tag / art_name
+        meta = art.with_name(art.name + ".json")
+        if not art.is_file():
+            info(f"  {cname}: not built for {tag} (run: da-models build {name}@{version})")
+            continue
+        if not meta.is_file() or read_json(meta).get("sha256") != sha256_file(art):
+            problems.append(f"{cname}: {art} does not agree with its record")
+        elif deep and rt == "tensorrt":
+            try:
+                check_engine_io(art, comp)
+            except DAError as e:
+                problems.append(str(e))
+    return problems
+
+
+def verify_remote(man, store, name, version):
+    entry = man.entry(name, version)
+    prefix = model_prefix(name, version)
+    problems = []
+    if store.stat(prefix + "model.json") is None:
+        problems.append(f"{store.url(prefix + 'model.json')} is missing (upload not complete)")
+    for f in entry["files"]:
+        st = store.stat(prefix + f["name"])
+        if st is None:
+            problems.append(f"missing in bucket: {f['name']}")
+        elif st["size"] != f["size"]:
+            problems.append(f"size in bucket differs: {f['name']}")
+        elif st["metadata"].get("sha256") != f["sha256"]:
+            problems.append(f"sha256 metadata in bucket differs: {f['name']}")
+    return problems
+
+
+def cmd_verify(args):
+    man = load_manifest(args)
+    root = store_root(args)
+    failed = checked = 0
+    name, ver = split_ref(args.ref) if args.ref else (None, None)
+    if name:
+        names = [name]
+    elif root.is_dir():
+        names = sorted(p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
+    else:
+        names = []
+    for n in names:
+        cur = current_version(root, n)
+        if cur is not None and not (root / n / cur).is_dir():
+            info(f"FAIL  {n}/current -> {cur}: target is missing")
+            failed += 1
+        for v in ([ver] if ver else local_versions(root, n)):
+            if not (root / n / v).is_dir():
+                if not args.remote:
+                    info(f"FAIL  {n}@{v}: not pulled")
+                    failed += 1
+                continue
+            checked += 1
+            problems = verify_local(man, root, n, v, args.deep)
+            mark = " (current)" if v == cur else ""
+            info(f"{'FAIL' if problems else 'OK  '}  local  {n}@{v}{mark}")
+            for p in problems:
+                info(f"      - {p}")
+            failed += bool(problems)
+    if args.remote:
+        store = open_store(man, args.credentials)
+        for n in ([name] if name else sorted(man.models)):
+            for v in ([ver] if ver else man.versions(n)):
+                checked += 1
+                problems = verify_remote(man, store, n, v)
+                info(f"{'FAIL' if problems else 'OK  '}  bucket {n}@{v}")
+                for p in problems:
+                    info(f"      - {p}")
+                failed += bool(problems)
+    if not checked:
+        info(f"nothing to verify in {root}" + ("" if args.remote else " (use --remote to check the bucket)"))
+    if failed:
+        raise DAError(f"{failed} check(s) failed")
+
+
+# --------------------------------------------------------------------------
+# publish
+# --------------------------------------------------------------------------
+
+def git(repo, *argv):
+    r = subprocess.run(["git", "-C", str(repo), *argv], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise DAError(f"git {' '.join(argv)} failed in {repo}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def make_runtime_archive(code, out, allow_unpushed=False):
+    """git archive of a clean commit -> runtime.tar.gz with members under runtime/.
+
+    Same commit -> same bytes (fixed mtime, gzip mtime 0), so a retry of a
+    failed publish uploads an identical object.
+    """
+    repo = Path(code["repo"]).expanduser()
+    subdir = str(code.get("subdir", "")).strip("/")
+    top = git(repo, "rev-parse", "--show-toplevel")
+    dirty = git(top, "status", "--porcelain", "--untracked-files=all")
+    if dirty:
+        raise DAError(f"git working tree is not clean: {top}\n{dirty[:2000]}\n"
+                      f"Commit or remove the changes, then publish again.")
+    commit = git(top, "rev-parse", "HEAD")
+    if not allow_unpushed and not git(top, "branch", "-r", "--contains", commit):
+        raise DAError(f"commit {commit[:12]} in {top} is not on a remote branch. Push it first "
+                      f"(or use --allow-unpushed).")
+    if subdir:
+        git(top, "cat-file", "-e", f"{commit}:{subdir}")
+    commit_time = int(git(top, "show", "-s", "--format=%ct", commit))
+    raw = subprocess.run(["git", "-C", top, "archive", "--format=tar", commit] + (["--", subdir] if subdir else []),
+                         capture_output=True, check=True).stdout
+    n = 0
+    with tarfile.open(fileobj=io.BytesIO(raw)) as src, open(out, "wb") as fo, \
+            gzip.GzipFile(filename="", mode="wb", fileobj=fo, mtime=0) as gz, \
+            tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as dst:
+        for m in src.getmembers():
+            rel = m.name.rstrip("/")
+            if subdir:
+                if not rel.startswith(subdir + "/"):
+                    continue
+                rel = rel[len(subdir) + 1:]
+            m2 = tarfile.TarInfo("runtime/" + rel)
+            m2.type, m2.mode, m2.size, m2.linkname = m.type, m.mode, m.size, m.linkname
+            m2.mtime = commit_time
+            dst.addfile(m2, src.extractfile(m) if m.isfile() else None)
+            n += m.isfile()
+    if not n:
+        raise DAError(f"{top}:{subdir or '.'} has no files at {commit[:12]}")
+    remote = ""
+    with contextlib.suppress(DAError):
+        remote = git(top, "remote", "get-url", "origin")
+    return {"file": RUNTIME_ARCHIVE, "git_repo": remote or top, "git_commit": commit,
+            "git_subdir": subdir or "."}
+
+
+def build_components(spec, paths):
+    comps = {}
+    for cname, c in (spec.get("components") or {}).items():
+        if not NAME_RE.match(cname):
+            raise DAError(f"bad component name '{cname}'")
+        c = dict(c)
+        rt = c.get("runtime")
+        if rt not in RUNTIMES:
+            raise DAError(f"component {cname}: runtime must be one of {RUNTIMES}")
+        if c.get("source") not in paths:
+            raise DAError(f"component {cname}: source '{c.get('source')}' is not in files")
+        if not c.get("precision"):
+            raise DAError(f"component {cname}: precision is required")
+        if rt == "tensorrt":
+            if not FILE_RE.match(str(c.get("engine", ""))):
+                raise DAError(f"component {cname}: engine (file name) is required")
+            flags = c.get("trtexec_flags", "")
+            if re.search(r"--(onnx|saveEngine|loadEngine)\b", flags):
+                raise DAError(f"component {cname}: trtexec_flags must not set --onnx/--saveEngine/--loadEngine")
+        if rt == "pytorch" and c.get("build"):
+            b = c["build"]
+            for k in ("dir", "command", "artifacts", "cache_file"):
+                if not b.get(k):
+                    raise DAError(f"component {cname}: build.{k} is required")
+        if c["source"].endswith(".onnx") and rt != "pytorch":
+            ins, outs = onnx_io(paths[c["source"]])
+            for key, got in (("inputs", ins), ("outputs", outs)):
+                if c.get(key):
+                    if [t["name"] for t in c[key]] != [t["name"] for t in got]:
+                        raise DAError(f"component {cname}: {key} names {[t['name'] for t in c[key]]} "
+                                      f"do not agree with the ONNX {[t['name'] for t in got]}")
+                    for t, g in zip(c[key], got):
+                        t.setdefault("dtype", g["dtype"])
+                else:
+                    c[key] = got
+        if not c.get("inputs") or not c.get("outputs"):
+            raise DAError(f"component {cname}: inputs and outputs are required")
+        comps[cname] = c
+    if not comps:
+        raise DAError("spec has no components")
+    return comps
+
+
+def cmd_publish(args):
+    man = load_manifest(args)
+    spec_path = Path(args.spec)
+    spec = yaml.safe_load(spec_path.read_text()) or {}
+    name, version, status = spec.get("model"), str(spec.get("version", "")), spec.get("status")
+    if not NAME_RE.match(str(name)):
+        raise DAError(f"bad model name '{name}'")
+    parse_version(version)
+    if status not in STATUSES:
+        raise DAError(f"status must be one of {STATUSES}")
+    with contextlib.suppress(Missing):
+        if version in man.versions(name):
+            raise Exists(f"{name}@{version} is already in models.yaml. A version is immutable: use a new number.")
+
+    store = open_store(man, args.credentials, prefer_write=True)
+    prefix = model_prefix(name, version)
+    if store.stat(prefix + "model.json") is not None:
+        raise Exists(f"{store.url(prefix)} is already published but models.yaml does not list it. "
+                     f"Get models.yaml from git; do not publish this version again.")
+    dev = Device()
+    work = Path(tempfile.mkdtemp(prefix="da-publish-"))
+    try:
+        paths = {}
+        for f in spec.get("files") or []:
+            fname, fpath = f.get("name"), Path(str(f.get("path", ""))).expanduser()
+            if not fname or not FILE_RE.match(fname) or fname in RESERVED_FILES:
+                raise DAError(f"bad file name '{fname}'")
+            if fname in paths:
+                raise DAError(f"file name '{fname}' is given two times")
+            if not fpath.is_file():
+                raise DAError(f"{fname}: {fpath} not found")
+            paths[fname] = fpath
+        runtime = None
+        if spec.get("code"):
+            runtime = make_runtime_archive(spec["code"], work / RUNTIME_ARCHIVE, args.allow_unpushed)
+            paths[RUNTIME_ARCHIVE] = work / RUNTIME_ARCHIVE
+        components = build_components(spec, paths)
+
+        files = []
+        for fname, fpath in paths.items():
+            info(f"  sha256 {fname} ...")
+            files.append({"name": fname, "size": fpath.stat().st_size, "sha256": sha256_file(fpath)})
+        entry = {"status": status, "published_at": now_utc(), "published_by": store.identity}
+        for k in ("upstream", "notes"):
+            if spec.get(k):
+                entry[k] = spec[k]
+        entry["requires"] = spec.get("requires") or {}
+        entry["tested_with"] = dev.record()
+        for pkg, want in (entry["requires"].get("python") or {}).items():
+            python_package_problem(pkg, want)  # validates the syntax
+            with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+                entry["tested_with"].setdefault("python", {})[pkg] = importlib.metadata.version(pkg)
+        if runtime:
+            entry["runtime"] = runtime
+        entry["files"] = files
+        entry["components"] = components
+        for k in ("preprocessing", "postprocessing"):
+            if spec.get(k):
+                entry[k] = spec[k]
+
+        info(f"\n{name}@{version} ({status}): {len(files)} files, "
+             f"{human(sum(f['size'] for f in files))} -> {store.url(prefix)}")
+        if args.dry_run:
+            info("\n--- dry run: models.yaml entry ---\n" + yaml_dump({name: {"versions": {version: entry}}}))
+            return
+
+        # A failed earlier attempt can leave some objects. Keep them only when identical.
+        existing = {k[len(prefix):]: store.stat(k) for k in store.list(prefix)}
+        want = {f["name"]: f for f in files}
+        for fname, st in existing.items():
+            if fname not in want or st["metadata"].get("sha256") != want[fname]["sha256"]:
+                raise Exists(f"{store.url(prefix + fname)} exists with other content. Use a new version.")
+        for f in files:
+            if f["name"] in existing:
+                info(f"  keep  {f['name']} (already uploaded, same sha256)")
+                continue
+            info(f"  put   {f['name']} ({human(f['size'])})")
+            store.upload(prefix + f["name"], paths[f["name"]], {"sha256": f["sha256"]})
+        record = work / "model.json"
+        write_json(record, {"name": name, "version": version, "entry": entry})
+        store.upload(prefix + "model.json", record, {})  # last: marks the version complete
+        man.add(name, version, entry, spec.get("description"))
+        man.save()
+        info(f"\npublished {name}@{version}. Now commit models.yaml:\n"
+             f"  git -C {man.path.parent} add models.yaml && "
+             f"git -C {man.path.parent} commit -m 'publish {name}@{version}'")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# cache-put, device
+# --------------------------------------------------------------------------
+
+def cmd_cache_put(args):
+    man = load_manifest(args)
+    name, version = split_ref(args.ref)
+    if not version:
+        raise DAError("give the version: <model>@<version>")
+    entry = man.entry(name, version)
+    comp = (entry.get("components") or {}).get(args.component)
+    if not comp or comp["runtime"] != "tensorrt":
+        raise DAError(f"{name}@{version} has no TensorRT component '{args.component}'")
+    engine = Path(args.engine)
+    check_engine_io(engine, comp)
+    dev = Device()
+    tag = dev.tag_for(comp)
+    store = open_store(man, args.credentials, prefer_write=True)
+    key = engine_prefix(name, version, tag) + comp["engine"]
+    if store.stat(key) is not None:
+        raise Exists(f"{store.url(key)} already exists")
+    digest = sha256_file(engine)
+    meta = {"model": name, "version": version, "component": args.component, "tag": tag,
+            "runtime": "tensorrt", "precision": comp.get("precision"), "source": comp["source"],
+            "source_sha256": file_index(entry)[comp["source"]][1], "sha256": digest,
+            "size": engine.stat().st_size, "origin": "seeded", "seed_path": str(engine.resolve()),
+            "trtexec_flags": comp.get("trtexec_flags", ""), "note": args.note or "",
+            "host": socket.gethostname(), "created_at": now_utc(), **dev.record()}
+    with tempfile.TemporaryDirectory() as d:
+        mp = Path(d) / "meta.json"
+        write_json(mp, meta)
+        store.upload(key, engine, {"sha256": digest})
+        store.upload(key + ".json", mp, {})
+    info(f"put {engine} -> {store.url(key)}")
+
+
+def cmd_device(args):
+    dev = Device()
+    for k, v in dev.record().items():
+        info(f"{k:<12} {v}")
+    info(f"{'tag (trt)':<12} {dev.module}-jp{dev.jetpack}-trt{dev.trt}-<precision>")
+
+
+# --------------------------------------------------------------------------
+
+def main(argv=None):
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--manifest", help="models.yaml (default: next to this tool, or $DA_MODELS_MANIFEST)")
+    common.add_argument("--root", help=f"local model store (default: $DA_MODELS_ROOT or {DEFAULT_ROOT})")
+    common.add_argument("--credentials", help="service-account key file (default: $DA_MODELS_CREDENTIALS, "
+                                              "then ~/.config/driveragent-models/{reader,publisher}.json)")
+    p = argparse.ArgumentParser(prog="da-models", description="DriverAgent model registry client")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list", parents=[common], help="show models and versions")
+
+    s = sub.add_parser("pull", parents=[common], help="download a version into the local store")
+    s.add_argument("ref", help="<model> (newest production) or <model>@<version>")
+    s.add_argument("--set-current", action="store_true", help="point `current` to this version")
+    s.add_argument("--no-current", action="store_true", help="do not change `current`")
+
+    s = sub.add_parser("build", parents=[common], help="get or build the engines for this device")
+    s.add_argument("ref", help="<model> (the current version) or <model>@<version>")
+    s.add_argument("--only", metavar="COMPONENT", help="only this component")
+    s.add_argument("--no-cache", action="store_true", help="do not download from the engine cache")
+    s.add_argument("--no-upload", action="store_true", help="do not upload to the engine cache")
+    s.add_argument("--rebuild", action="store_true", help="build again with trtexec, ignore all caches")
+    s.add_argument("--require-upload", action="store_true", help="fail when the upload fails (not on denial)")
+
+    s = sub.add_parser("verify", parents=[common], help="check the local store (and the bucket)")
+    s.add_argument("ref", nargs="?", help="<model> or <model>@<version> (default: all)")
+    s.add_argument("--deep", action="store_true", help="also load each engine/ONNX and check its tensors")
+    s.add_argument("--remote", action="store_true", help="also check the bucket against models.yaml")
+
+    s = sub.add_parser("publish", parents=[common], help="upload a new version (publisher only)")
+    s.add_argument("spec", help="release spec YAML (see releases/)")
+    s.add_argument("--dry-run", action="store_true", help="check and print, do not upload")
+    s.add_argument("--allow-unpushed", action="store_true", help="allow a code commit not on a remote")
+
+    s = sub.add_parser("cache-put", parents=[common], help="put an engine built on this device in the cache")
+    s.add_argument("ref", help="<model>@<version>")
+    s.add_argument("component")
+    s.add_argument("engine", help="engine file built on this device")
+    s.add_argument("--note", help="free text kept in the engine record")
+
+    sub.add_parser("device", parents=[common], help="show the device identity")
+
+    args = p.parse_args(argv)
+    commands = {"list": cmd_list, "pull": cmd_pull, "build": cmd_build, "verify": cmd_verify,
+                "publish": cmd_publish, "cache-put": cmd_cache_put, "device": cmd_device}
+    try:
+        commands[args.cmd](args)
+        return 0
+    except DAError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

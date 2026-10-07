@@ -1,0 +1,36 @@
+# Release spec for `da-models publish`.
+model: system1-backbone
+version: 0.1.0
+status: candidate
+description: >-
+  Experimental ONNX export of the System 1 ConvNeXt V2 backbone (for a later
+  TensorRT backbone + PyTorch scorer pipeline). Not used by System 1 1.0.0.
+upstream:
+  model_version: v9e
+  epoch: 12
+notes: >-
+  LayerNorm is replaced by GroupNorm to avoid a TensorRT Transpose fusion
+  failure. This is not numerically exact (cosine similarity about 0.95-0.97).
+requires:
+  jetpack_min: "6.1"
+  tensorrt_min: "10.3"
+files:
+  - {name: backbone_nchw.onnx, path: ~/model/system1/backbone_nchw.onnx}
+  - {name: backbone_nchw.onnx.data, path: ~/model/system1/backbone_nchw.onnx.data}
+components:
+  backbone:
+    runtime: tensorrt
+    source: backbone_nchw.onnx
+    precision: fp16
+    engine: backbone_nchw.engine
+    trtexec_flags: "--fp16 --memPoolSize=workspace:4096 --shapes=images:6x3x256x704"
+    inputs:
+      - {name: images, shape: [6, 3, 256, 704]}
+    outputs:
+      - {name: feat_0, shape: [6, 256, 64, 176]}
+      - {name: feat_1, shape: [6, 256, 32, 88]}
+      - {name: feat_2, shape: [6, 256, 16, 44]}
+      - {name: feat_3, shape: [6, 256, 8, 22]}
+preprocessing:
+  normalize: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  final_size: [256, 704]

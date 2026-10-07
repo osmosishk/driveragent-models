@@ -1,0 +1,39 @@
+# Release spec for `da-models publish`.
+model: yolopx
+version: 0.1.0
+status: archived
+description: >-
+  Old stand-alone YOLOPX perception (PyTorch, epoch 195). Replaced by the
+  yolopx component of driverguard. Kept for reference and rollback only.
+upstream:
+  code: https://github.com/jiaoZ7688/YOLOPX
+  commit: 35627f645ef84baee93eef33283b807c42da77d3
+  local_changes: tools/demotext.py (ZMQ/capnp live runner) is not in upstream
+notes: >-
+  Launched by driveragent/startmodel.sh (MODEL_REGISTRY["yolopx"]) with
+  tools/demotext.py --weights <dir>/epoch-195.pth.
+requires:
+  jetpack_min: "6.1"
+  torch_min: "2.8"
+code:
+  repo: ~/driveragent-models
+  subdir: runtime/yolopx
+files:
+  - {name: epoch-195.pth, path: ~/model/yolopx/YOLOPX/weights/epoch-195.pth}
+components:
+  yolopx:
+    runtime: pytorch
+    source: epoch-195.pth
+    precision: fp16
+    inputs:
+      - {name: image, shape: [1, 3, 320, 640], dtype: float16}
+    outputs:
+      - {name: det, shape: [1, "N", 15], dtype: float16}
+      - {name: da_seg, shape: [1, 2, 320, 640], dtype: float16}
+      - {name: ll_seg, shape: [1, 2, 320, 640], dtype: float16}
+preprocessing:
+  input: BGR camera frame 1280x720
+  letterbox: {size: [320, 640]}
+  normalize: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+postprocessing:
+  nms: {conf_thres: 0.3, iou_thres: 0.45}
