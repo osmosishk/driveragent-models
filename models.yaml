@@ -186,6 +186,188 @@ models:
             throttle_mae_max: 0.02
             steer_mae_max: 0.02
             reference: reference_dtcp_pc.json
+      1.0.1:
+        status: candidate
+        published_at: '2026-10-07T11:05:51Z'
+        published_by: da-models-publisher@ancient-binder-127813.iam.gserviceaccount.com
+        upstream:
+          bundle_version: v1-fp32-2026-05-25
+          weights:
+            dtcp_nusc_route_v1.pt: e342c0b5d9d5b07b930852192fded58f66d2f123c70fcac459522907e2b45e3a
+            yolopx_v2_epoch30.pth: 98736417397d5a0a86a991046db5ecc28ac8c9b4e57bbb3175c8947bba9b9066
+        notes: 'Variant of 1.0.0 for TensorRT 8.6 units (JetPack 6.0, e.g. orin-nx): same ONNX files,
+          same runtime code, lower minimum versions, and the Python packages pycuda and onnxruntime listed.
+          Candidate until validate_jetson.py passes on such a unit. Not published: dtcp_v1_fp16.engine
+          (old rollback engine). Its outputs are not finite (mu/sigma collapse) and no file proves which
+          ONNX made it.'
+        requires:
+          jetpack_min: '6.0'
+          tensorrt_min: '8.6'
+          onnxruntime_min: '1.13'
+          python:
+            pycuda: '>=2024.1'
+            onnxruntime: '>=1.13'
+        tested_with:
+          device: agxorin64
+          l4t: 36.4.7
+          jetpack: 6.2.1
+          cuda: 12.6.11
+          tensorrt: 10.3.0
+          torch: 2.8.0
+          onnxruntime: 1.23.2
+          python:
+            pycuda: '2026.1'
+            onnxruntime: 1.23.2
+        runtime:
+          file: runtime.tar.gz
+          git_repo: git@github.com:osmosishk/driveragent-models.git
+          git_commit: 47db44ddf30bae3376ea6e66d017d1b2e0b79a24
+          git_subdir: runtime/driverguard
+        files:
+        - name: yolopx_v2.onnx
+          size: 131936832
+          sha256: 3a49f4ebe346bea4e54d30a01b727c8fd27bfd3ef3486f39ba2698679683b232
+        - name: dtcp_v1_main.onnx
+          size: 93247247
+          sha256: e18286e8daaddae350025aca626a6ef65496dc824028748ffbcc809f23e89d35
+        - name: dtcp_v1_control.onnx
+          size: 3793878
+          sha256: 502a83221979f3fef0bab058e06787303bf5556e33eb5ea770e5af847029bd82
+        - name: bundle_manifest.json
+          size: 3306
+          sha256: ccd05c9cb64dcae7722e0691d0669f75877267a8b078d7ff75bf7908c79073ab
+        - name: reference_dtcp_pc.json
+          size: 1909
+          sha256: ac1be9f6e32a7651239eb88237336bf9667586beffcb510beb2c098606ab8fdc
+        - name: validation_samples.tar.gz
+          size: 815389
+          sha256: 1d9de4a1d131675c59d4a8f5024cf7f8e51379c4388c73ee3bae7d527595e442
+        - name: runtime.tar.gz
+          size: 51493
+          sha256: f2667bec6d138df3286b364a7461838c79ab9e73dcd93cf90f35d9b0668cd94b
+        components:
+          yolopx:
+            runtime: tensorrt
+            source: yolopx_v2.onnx
+            precision: fp16
+            engine: yolopx_v2.engine
+            trtexec_flags: --fp16 --memPoolSize=workspace:4096 --shapes=image:1x3x384x640
+            inputs:
+            - name: image
+              shape: [1, 3, 384, 640]
+              dtype: float32
+            outputs:
+            - name: det
+              shape: [1, 5040, 15]
+              dtype: float32
+            - name: da_seg
+              shape: [1, 2, 384, 640]
+              dtype: float32
+            - name: ll_seg
+              shape: [1, 2, 384, 640]
+              dtype: float32
+          dtcp_main:
+            runtime: tensorrt
+            source: dtcp_v1_main.onnx
+            precision: fp32
+            engine: dtcp_v1_main.engine
+            trtexec_flags: --memPoolSize=workspace:4096 --noTF32
+            inputs:
+            - name: image
+              shape: [1, 3, 256, 928]
+              dtype: float32
+            - name: state
+              shape: [1, 9]
+              dtype: float32
+            - name: target_point
+              shape: [1, 2]
+              dtype: float32
+            outputs:
+            - name: pred_wp
+              shape: [1, 4, 2]
+              dtype: float32
+            - name: pred_speed
+              shape: [1, 1]
+              dtype: float32
+            - name: cnn_feature
+              shape: [1, 512, 8, 29]
+              dtype: float32
+            - name: measurement_feature
+              shape: [1, 128]
+              dtype: float32
+          dtcp_control:
+            runtime: onnxruntime-cpu
+            source: dtcp_v1_control.onnx
+            precision: fp32
+            inputs:
+            - name: cnn_feature
+              shape: [1, 512, 8, 29]
+              dtype: float32
+            - name: measurement_feature
+              shape: [1, 128]
+              dtype: float32
+            outputs:
+            - name: mu
+              shape: [1, 2]
+              dtype: float32
+            - name: sigma
+              shape: [1, 2]
+              dtype: float32
+        preprocessing:
+          yolopx:
+            input: BGR uint8 camera frame (1280x720)
+            letterbox:
+              size: [384, 640]
+              pad_value: 114
+              interpolation: INTER_AREA
+            color: BGR->RGB
+            scale: 1/255
+            normalize:
+              mean: [0.485, 0.456, 0.406]
+              std: [0.229, 0.224, 0.225]
+            layout: NCHW float32
+          dtcp:
+            image:
+              resize: stretch to 928x256 (no letterbox)
+              interpolation: INTER_LINEAR
+              scale: 1/255
+              normalize: imagenet
+              layout: NCHW float32
+            state: '[speed_mps/12, target_lat_right_m, target_fwd_m, one_hot(command, 6)] -> 1x9'
+            target_point: '[lat_right_m, fwd_m] -> 1x2'
+            command_remap:
+              0: 0
+              1: 1
+              2: 3
+              3: 3
+              4: 0
+              5: 1
+        postprocessing:
+          yolopx:
+            nms:
+              conf_thres: 0.3
+              iou_thres: 0.45
+              max_det: 300
+            classes:
+            - person
+            - rider
+            - car
+            - bus
+            - truck
+            - bike
+            - motor
+            - traffic light
+            - traffic sign
+            - train
+            masks: da_seg/ll_seg argmax, un-pad, resize to camera size
+          dtcp:
+            pred_speed_mps: pred_speed * 12
+            steer: bicycle model from pred_wp[3]; wheelbase 1.78 m; max wheel angle 28 deg
+            controls: mu/sigma from dtcp_control -> throttle/brake (beta_mode.py)
+          validation:
+            throttle_mae_max: 0.02
+            steer_mae_max: 0.02
+            reference: reference_dtcp_pc.json
   system1:
     description: System 1 trajectory model (ConvNeXt V2 Tiny + factorized trajectory scorer, 47.6M params).
       Runs in PyTorch with bf16 autocast and two custom CUDA ops.
