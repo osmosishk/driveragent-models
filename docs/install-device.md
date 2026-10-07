@@ -86,5 +86,36 @@ A candidate or archived version needs the version number, for example
 
 ## 7. Orin NX settings
 
-See section "Orin NX" in the Phase 4 report (added after the measurements
-on `demo`).
+An engine cache entry is valid only for one tag. An Orin NX has a different
+tag (`orinnx16-...` or `orinnx8-...`), so the **first** build on each Orin NX
+runs `trtexec` on that unit. With the read-only credential the engine is not
+uploaded, so **each** Orin NX unit builds its engines one time.
+
+Before the build:
+```
+sudo nvpmodel -m 0        # MAXN (MAXN SUPER on JetPack 6.2 and later)
+sudo jetson_clocks
+free -h                   # make sure that swap (zram) is on
+```
+
+| Setting | Orin NX 16 GB | Orin NX 8 GB |
+|---|---|---|
+| TensorRT workspace | default (4096 MiB) | `./da-models build driverguard --workspace-mb 1024` |
+| Peak build memory (measured on demo) | about 2.1 GB `trtexec` RSS + workspace + about 0.5 GB engine | about 3.5 GB in total with 1024 MiB |
+| System 1 CUDA ops compile | `MAX_JOBS=4 ./da-models build system1@<v>` | `MAX_JOBS=2 ...` (each nvcc job can use 1-2 GB) |
+| Other GPU programs during the build | stop them if possible | stop them |
+| Expected build time (yolopx FP16) | about 30-50 min (demo: 14-17 min) | about 35-60 min |
+
+The 1024 MiB workspace was tested on `demo`: same outputs (masks 100 % equal,
+same controls), yolopx same rate, dtcp_main 9.5 % slower.
+
+### Fit and rate (estimates from demo measurements; confirm on a real unit)
+
+| Model | Memory | Orin NX 16 GB | Orin NX 8 GB |
+|---|---|---|---|
+| DriverGuard 1.0.0 | about 1.0 GB RSS + 0.3 GB GPU | fits | fits |
+| DriverGuard rate (target 10 Hz) | demo: 91-98 ms per frame (10-11 Hz) | about 125-165 ms (6-8 Hz): **too slow for 10 Hz** | about 130-180 ms (5.5-7.5 Hz): **too slow for 10 Hz** |
+| System 1 1.0.1 | 3.3 GB RSS + 1.1 GB CUDA | fits | **does not fit** with DriverGuard and the OS |
+| System 1 rate (default 5 Hz) | demo: 212 ms (4.7 Hz), already below 5 Hz | about 470-720 ms (1.4-2.1 Hz): **too slow** | not applicable |
+
+Use `--rate 5` for DriverGuard on an Orin NX until a real unit is measured.
