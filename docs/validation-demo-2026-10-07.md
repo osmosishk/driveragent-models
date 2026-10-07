@@ -106,7 +106,8 @@ preprocessing, values in [0, 1] (the ONNX graph normalizes at its input).
 Trajectory with the TRT backbone + bf16 scorer vs production (torch bf16
 backbone + bf16 scorer): last waypoint **1.29 m** apart, headings differ in
 sign. Production vs FP32 features: 0.06 max. Result: the candidate backbone
-is **not usable**. Cause: GroupNorm in place of LayerNorm in the export.
+is **not usable**. Probable cause (from DEPLOY_INSTRUCTIONS.md, not proven here):
+GroupNorm in place of LayerNorm in the export.
 
 ## 5. System 1 time split (bf16, raw 6x1600x900 uint8 -> trajectory)
 
