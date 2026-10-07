@@ -144,7 +144,7 @@ extracts it into `<root>/<model>/<version>/runtime/`.
 |---|---|---|
 | `runtime/driverguard/` | `run.py`, `runner/`, `jetson_runtime/`, `validate_jetson.py`, docs | Osmosis code (from `~/model/driverguard`, `~/model/jetson_bundle` on `demo`) |
 | `runtime/system1/system1/` | System 1 package, custom CUDA ops source | Osmosis code (from `~/model/system1`) |
-| `runtime/system1/models_convnext/` | ConvNeXt V2 + FPN backbone (uses timm) | From `~/model/sparsedrive/models_convnext` on `demo`. **Upstream URL and commit: unknown.** The folder has no git data and no LICENSE file. |
+| `runtime/system1/models_convnext/`, `runtime/system1/models/backbone.py` | ConvNeXt V2 backbone (uses timm); FPN and GridMask that it loads by file path | From `~/model/sparsedrive/models_convnext` and `~/model/sparsedrive/models/backbone.py` on `demo`. **Upstream URL and commit: unknown.** The folder has no git data and no LICENSE file. |
 | `runtime/yolopx/` | `lib/`, `tools/demotext.py`, `LICENSE` | https://github.com/jiaoZ7688/YOLOPX, commit `35627f645ef84baee93eef33283b807c42da77d3` (MIT, see `runtime/yolopx/LICENSE`). `tools/demotext.py` is a local addition. |
 
 Commit `4ff9985` is a byte-identical copy of the code on `demo`. Later commits
