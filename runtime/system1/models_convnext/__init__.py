@@ -1,0 +1,1 @@
+from models_convnext.backbone import ConvNeXtV2Backbone, SparseDriveConvNeXtBackbone
