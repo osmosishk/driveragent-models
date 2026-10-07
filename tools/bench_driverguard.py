@@ -98,4 +98,7 @@ res = {n: {"mean": round(float(np.mean(v)), 2), "p95": round(float(np.percentile
 res["sum_of_108ms_stages"] = round(float(np.mean(totals_108)), 1)
 res["full_frame"] = round(sum(r["mean"] for r in res.values() if isinstance(r, dict)), 1)
 res["frame_size"] = [int(h0), int(w0)]
+import resource  # noqa: E402
+res["process_peak_rss_mb"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
+res["rate_hz_full_frame"] = round(1000.0 / res["full_frame"], 2)
 print(json.dumps(res, indent=1))
