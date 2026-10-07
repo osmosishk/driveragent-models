@@ -261,6 +261,21 @@ class TestUnits(unittest.TestCase):
         with self.assertRaises(t.DAError):
             t.parse_version("1.0")
 
+    def test_engine_tag_differs_by_tensorrt_version(self):
+        t = load_tool()
+        comp = {"runtime": "tensorrt", "precision": "fp16"}
+
+        def tag(module, jp, trtv):
+            d = t.Device()
+            d.__dict__.update(module=module, jetpack=jp, trt=trtv)  # fill the cached properties
+            return d.tag_for(comp)
+        nx = tag("orinnx16", "6.0", "8.6.2")
+        agx = tag("agxorin64", "6.2.1", "10.3.0")
+        self.assertEqual(nx, "orinnx16-jp6.0-trt8.6.2-fp16")
+        self.assertNotEqual(tag("orinnx16", "6.0", "8.6.2"), tag("orinnx16", "6.0", "10.3.0"))
+        self.assertNotEqual(nx, agx)
+        self.assertEqual(t.L4T_TO_JETPACK["36.3.0"], "6.0")
+
     def test_apply_workspace(self):
         t = load_tool()
         self.assertEqual(t.apply_workspace(["--fp16", "--memPoolSize=workspace:4096", "--noTF32"], 1024),
