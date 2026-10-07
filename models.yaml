@@ -328,3 +328,70 @@ models:
             mean: [0.485, 0.456, 0.406]
             std: [0.229, 0.224, 0.225]
           final_size: [256, 704]
+  yolopx:
+    description: Old stand-alone YOLOPX perception (PyTorch, epoch 195). Replaced by the yolopx component
+      of driverguard. Kept for reference and rollback only.
+    versions:
+      0.1.0:
+        status: archived
+        published_at: '2026-10-07T08:27:49Z'
+        published_by: da-models-publisher@ancient-binder-127813.iam.gserviceaccount.com
+        upstream:
+          code: https://github.com/jiaoZ7688/YOLOPX
+          commit: 35627f645ef84baee93eef33283b807c42da77d3
+          local_changes: tools/demotext.py (ZMQ/capnp live runner) is not in upstream
+        notes: Launched by driveragent/startmodel.sh (MODEL_REGISTRY["yolopx"]) with tools/demotext.py
+          --weights <dir>/epoch-195.pth.
+        requires:
+          jetpack_min: '6.1'
+          torch_min: '2.8'
+        tested_with:
+          device: agxorin64
+          l4t: 36.4.7
+          jetpack: 6.2.1
+          cuda: 12.6.11
+          tensorrt: 10.3.0
+          torch: 2.8.0
+          onnxruntime: 1.23.2
+        runtime:
+          file: runtime.tar.gz
+          git_repo: git@github.com:osmosishk/driveragent-models.git
+          git_commit: 874c406b244e7e0b512909aba649f97dbc5d117e
+          git_subdir: runtime/yolopx
+        files:
+        - name: epoch-195.pth
+          size: 396551195
+          sha256: 52e989dc3d15c9e4ee78be217f338e05f04821ade250bfce0a723a8b8633de58
+        - name: runtime.tar.gz
+          size: 75055
+          sha256: c3ef4d76cf7fa95f914e5499b36e25c732c80e3d06af8abd3abc8367aff56ad8
+        components:
+          yolopx:
+            runtime: pytorch
+            source: epoch-195.pth
+            precision: fp16
+            inputs:
+            - name: image
+              shape: [1, 3, 320, 640]
+              dtype: float16
+            outputs:
+            - name: det
+              shape: [1, N, 15]
+              dtype: float16
+            - name: da_seg
+              shape: [1, 2, 320, 640]
+              dtype: float16
+            - name: ll_seg
+              shape: [1, 2, 320, 640]
+              dtype: float16
+        preprocessing:
+          input: BGR camera frame 1280x720
+          letterbox:
+            size: [320, 640]
+          normalize:
+            mean: [0.485, 0.456, 0.406]
+            std: [0.229, 0.224, 0.225]
+        postprocessing:
+          nms:
+            conf_thres: 0.3
+            iou_thres: 0.45
