@@ -136,6 +136,7 @@ class TestPublishPull(Env):
 
         self.run_tool("pull", "tiny")
         self.assertEqual(os.readlink(self.root / "tiny" / "current"), "1.0.0")
+        self.assertEqual(stat.S_IMODE((self.root / "tiny/1.0.0").stat().st_mode), 0o755)
         self.assertEqual((self.root / "tiny/1.0.0/runtime/run.py").read_text(), "print('tiny')\n")
         self.assertFalse((self.root / "tiny/1.0.0/runtime/other.txt").exists())
         self.assertEqual(list((self.root / ".tmp").iterdir()), [])

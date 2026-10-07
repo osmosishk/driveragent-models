@@ -760,6 +760,7 @@ def pull_version(store, root, name, version, entry):
             extract_tar(tmp / rt["file"], tmp)
         write_json(tmp / "model.json", {"name": name, "version": version, "bucket": store.url(""),
                                         "pulled_at": now_utc(), "entry": entry})
+        os.chmod(tmp, 0o755)  # mkdtemp makes 0700; services may run as another user
         (root / name).mkdir(exist_ok=True)
         os.rename(tmp, root / name / version)  # atomic on the same file system
     except BaseException:
