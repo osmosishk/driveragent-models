@@ -11,14 +11,16 @@ If RouteGuidance is unavailable / stale / inactive, latest_guidance() reports
 fresh=False and the runner falls back to the CLI --command / --target defaults.
 """
 
+import os
 import sys
 import time
 import threading
 
-sys.path.insert(0, "/home/tonyho/driveragent")
+DRIVERAGENT_ROOT = os.path.expanduser(os.environ.get("DRIVERAGENT_ROOT", "~/driveragent"))
+sys.path.insert(0, DRIVERAGENT_ROOT)
 from message.capnp_pubsub import Subscriber
 
-CAPNP_SCHEMA = "/home/tonyho/driveragent/message/message.capnp"
+CAPNP_SCHEMA = os.path.join(DRIVERAGENT_ROOT, "message", "message.capnp")
 ROUTE_GUIDANCE_ADDR = "tcp://127.0.0.1:5605"
 
 FRESH_S = 1.0          # guidance older than this is ignored

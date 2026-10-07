@@ -20,29 +20,51 @@ but it nails the parity-report symptoms: FP16 collapse zeros throttle, FP32
 restores it. If this passes, the new engine is safe to deploy.
 
 Usage (server, capture):
-    PYTHONPATH=/home/tonyho/development/DTCP/deploy \\
-      /home/tonyho/anaconda3/envs/DTCP/bin/python \\
-      /home/tonyho/development/jetson_bundle/validate_jetson.py \\
-      --capture-pc-reference
+    python validate_jetson.py --capture-pc-reference \\
+      --dtcp-source <dir with dtcp_infer.py> --weights <dtcp_nusc_route_v1.pt> \\
+      --samples <samples dir> --reference <samples dir>/reference_dtcp_pc.json
 
-Usage (Jetson, validate):
-    PYTHONPATH=~/jetson_bundle/jetson_runtime python \\
-      ~/jetson_bundle/validate_jetson.py \\
-      --dtcp-engine   ~/jetson_bundle/engines/dtcp_v1_fp32.engine \\
-      --yolopx-engine ~/jetson_bundle/engines/yolopx_v2_fp16.engine
+Usage (Jetson, validate; registry layout from da-models):
+    python <version>/runtime/validate_jetson.py
+    # defaults: engines from <version>/engines/<tag>/, control ONNX, reference
+    # and samples (validation_samples.tar.gz) from <version>/
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import tarfile
+import tempfile
 from pathlib import Path
 
-BUNDLE = Path(__file__).resolve().parent
-SAMPLES = BUNDLE / "samples"
-DEFAULT_REF = SAMPLES / "reference_dtcp_pc.json"
-DEFAULT_MANIFEST = SAMPLES / "scene_manifest_subset.json"
-DEFAULT_FRAMES_DIR = SAMPLES / "cam_front"
+HERE = Path(__file__).resolve().parent          # <version>/runtime
+MODEL_DIR = HERE.parent                          # <version>
+DEFAULT_SAMPLES = MODEL_DIR / "validation_samples.tar.gz"
+DEFAULT_REF = MODEL_DIR / "reference_dtcp_pc.json"
+# Set by use_samples(): a samples dir with scene_manifest_subset.json + cam_front/.
+DEFAULT_MANIFEST = None
+DEFAULT_FRAMES_DIR = None
+
+
+def use_samples(path: Path):
+    """Point the loader at a samples dir, or at a .tar.gz of one (extracted to a temp dir)."""
+    global DEFAULT_MANIFEST, DEFAULT_FRAMES_DIR
+    path = Path(path)
+    if path.is_file():
+        tmp = Path(tempfile.mkdtemp(prefix="dg-samples-"))
+        with tarfile.open(path) as t:
+            t.extractall(tmp, filter="data")
+        path = tmp
+    if not (path / "scene_manifest_subset.json").is_file():
+        raise SystemExit(f"no scene_manifest_subset.json in {path}")
+    DEFAULT_MANIFEST = path / "scene_manifest_subset.json"
+    DEFAULT_FRAMES_DIR = path / "cam_front"
+
+
+def _find_engine(name):
+    hits = sorted((MODEL_DIR / "engines").glob(f"*/{name}"))
+    return str(hits[0]) if len(hits) == 1 else None
 
 # Hard-fail thresholds — match MANIFEST.json "sample_thresholds".
 THRESH_THROTTLE_MAE = 0.02
@@ -70,21 +92,21 @@ def _load_manifest():
     return rows
 
 
-def capture_pc_reference(out_path: Path):
+def capture_pc_reference(out_path: Path, dtcp_source: str, weights: str):
     """Run DTCPPlanner (PC PyTorch) and dump golden actions."""
     import numpy as np
     from PIL import Image
-    sys.path.insert(0, "/home/tonyho/development/DTCP/deploy")
+    sys.path.insert(0, dtcp_source)
     from dtcp_infer import DTCPPlanner  # noqa: E402
 
-    weights = BUNDLE / "weights" / "dtcp_nusc_route_v1.pt"
+    weights = Path(weights)
     if not weights.exists():
         raise SystemExit(f"missing weights: {weights}")
     planner = DTCPPlanner(weights=str(weights), device="cuda")
 
     rows = _load_manifest()
     ref = {
-        "source": "PC PyTorch DTCPPlanner (jetson_bundle/weights/dtcp_nusc_route_v1.pt)",
+        "source": f"PC PyTorch DTCPPlanner ({weights.name})",
         "frames": [],
     }
     print(f"capturing PC reference for {len(rows)} frames")
@@ -124,13 +146,13 @@ def validate_on_jetson(dtcp_engine: str, yolopx_engine: str, ref_path: Path,
     import cv2
     import numpy as np
     import onnxruntime as ort
-    sys.path.insert(0, str(BUNDLE / "jetson_runtime"))
+    sys.path.insert(0, str(HERE / "jetson_runtime"))
     from trt_runner import TRTRunner
     from preprocess import preprocess_dtcp, preprocess_yolopx
     from beta_mode import beta_mode_action
 
     if control_onnx is None:
-        control_onnx = str(BUNDLE / "onnx" / "dtcp_v1_control.onnx")
+        control_onnx = str(MODEL_DIR / "dtcp_v1_control.onnx")
 
     if not ref_path.exists():
         raise SystemExit(f"reference missing: {ref_path} — run with --capture-pc-reference on the server first")
@@ -211,22 +233,31 @@ def validate_on_jetson(dtcp_engine: str, yolopx_engine: str, ref_path: Path,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--capture-pc-reference", action="store_true",
-                    help="run PC PyTorch DTCPPlanner and write samples/reference_dtcp_pc.json")
+                    help="run PC PyTorch DTCPPlanner and write the reference JSON")
+    ap.add_argument("--dtcp-source", help="capture only: dir that contains dtcp_infer.py")
+    ap.add_argument("--weights", help="capture only: DTCP PyTorch weights (dtcp_nusc_route_v1.pt)")
+    ap.add_argument("--samples", default=str(DEFAULT_SAMPLES),
+                    help="samples dir or .tar.gz; default <version>/validation_samples.tar.gz")
     ap.add_argument("--reference", default=str(DEFAULT_REF))
     ap.add_argument("--dtcp-engine", default=None,
-                    help="TRT engine path; default ~/jetson_bundle/engines/dtcp_v1_fp32.engine")
+                    help="TRT engine path; default <version>/engines/<tag>/dtcp_v1_main.engine")
     ap.add_argument("--yolopx-engine", default=None,
-                    help="optional YOLOPX engine to load-check; default ~/jetson_bundle/engines/yolopx_v2_fp16.engine")
+                    help="optional YOLOPX engine to load-check; default <version>/engines/<tag>/yolopx_v2.engine")
     ap.add_argument("--control-onnx", default=None,
-                    help="control sub-graph ONNX path; default <bundle>/onnx/dtcp_v1_control.onnx")
+                    help="control sub-graph ONNX path; default <version>/dtcp_v1_control.onnx")
     args = ap.parse_args()
+    use_samples(Path(args.samples))
 
     if args.capture_pc_reference:
-        capture_pc_reference(Path(args.reference))
+        if not args.dtcp_source or not args.weights:
+            raise SystemExit("--capture-pc-reference needs --dtcp-source and --weights")
+        capture_pc_reference(Path(args.reference), args.dtcp_source, args.weights)
         return 0
 
-    dtcp = args.dtcp_engine or str(Path.home() / "jetson_bundle/engines/dtcp_v1_fp32.engine")
-    yolopx = args.yolopx_engine or str(Path.home() / "jetson_bundle/engines/yolopx_v2_fp16.engine")
+    dtcp = args.dtcp_engine or _find_engine("dtcp_v1_main.engine")
+    yolopx = args.yolopx_engine or _find_engine("yolopx_v2.engine")
+    if not dtcp:
+        raise SystemExit("no DTCP engine: run `da-models build driverguard` or give --dtcp-engine")
     return validate_on_jetson(dtcp, yolopx, Path(args.reference), control_onnx=args.control_onnx)
 
 

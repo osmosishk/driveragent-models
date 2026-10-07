@@ -5,14 +5,16 @@ subscriber can't connect (no CarState producer running) we report 0 m/s
 so inference still runs — useful for bench testing.
 """
 
+import os
 import sys
 import time
 import threading
 
-sys.path.insert(0, "/home/tonyho/driveragent")
+DRIVERAGENT_ROOT = os.path.expanduser(os.environ.get("DRIVERAGENT_ROOT", "~/driveragent"))
+sys.path.insert(0, DRIVERAGENT_ROOT)
 from message.capnp_pubsub import Subscriber
 
-CAPNP_SCHEMA = "/home/tonyho/driveragent/message/message.capnp"
+CAPNP_SCHEMA = os.path.join(DRIVERAGENT_ROOT, "message", "message.capnp")
 CARSTATE_ADDR = "tcp://127.0.0.1:5592"
 
 

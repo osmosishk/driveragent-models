@@ -1,8 +1,7 @@
 """DriverGuard inference loop: front cam → YOLOPX + DTCP → ZMQ publish.
 
-Invoked by /home/tonyho/model/driverguard/run.py, which puts the driveragent
-root, the jetson_bundle/jetson_runtime root, and this package on sys.path
-first.
+Invoked by <version>/runtime/run.py, which puts the driveragent root, the
+runtime/jetson_runtime folder, and this package on sys.path first.
 
 Hybrid DTCP inference (v1-fp32-2026-05-25):
   - Main TRT engine: image/state/target -> pred_wp, pred_speed, cnn_feature,
@@ -55,7 +54,9 @@ MAX_WHEEL_ANGLE_RAD = math.radians(28.0)
 
 # Engine/version tags emitted on every DriverGuardResult.
 _ENGINE_PRECISION = "FP32+ort_control"
-_BUNDLE_MANIFEST = "/home/tonyho/model/jetson_bundle/MANIFEST.json"
+# <version>/bundle_manifest.json (this file is <version>/runtime/runner/runner.py).
+_BUNDLE_MANIFEST = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "bundle_manifest.json")
 
 
 def _read_model_version(manifest_path=_BUNDLE_MANIFEST):
@@ -373,4 +374,4 @@ def main(args):
 if __name__ == "__main__":
     raise SystemExit(
         "Do not run runner/runner.py directly. "
-        "Use: python /home/tonyho/model/driverguard/run.py")
+        "Use: python <version>/runtime/run.py")
