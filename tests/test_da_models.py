@@ -261,6 +261,13 @@ class TestUnits(unittest.TestCase):
         with self.assertRaises(t.DAError):
             t.parse_version("1.0")
 
+    def test_apply_workspace(self):
+        t = load_tool()
+        self.assertEqual(t.apply_workspace(["--fp16", "--memPoolSize=workspace:4096", "--noTF32"], 1024),
+                         ["--fp16", "--noTF32", "--memPoolSize=workspace:1024"])
+        self.assertEqual(t.apply_workspace(["--workspace=4096"], 512), ["--memPoolSize=workspace:512"])
+        self.assertEqual(t.apply_workspace([], 256), ["--memPoolSize=workspace:256"])
+
     def test_runtime_archive_is_reproducible(self):
         t = load_tool()
         env = Env("setUp")

@@ -176,6 +176,12 @@ def python_package_problem(pkg, want):
     return None if ok else f"needs Python package {pkg}{want}; this device has {have}"
 
 
+def apply_workspace(flags, mb):
+    """Set the trtexec workspace pool to `mb` MiB (replace or append)."""
+    out = [f for f in flags if not re.match(r"^--(memPoolSize=workspace:\d+\w*|workspace=\d+)$", f)]
+    return out + [f"--memPoolSize=workspace:{int(mb)}"]
+
+
 def split_ref(ref):
     name, _, ver = ref.partition("@")
     if not NAME_RE.match(name):
@@ -954,6 +960,12 @@ class Builder:
         tmp = edir / f".{comp['engine']}.{os.getpid()}.tmp"
         log = edir / (comp["engine"] + ".build.log")
         flags = shlex.split(comp.get("trtexec_flags", ""))
+        # The workspace is only a builder memory limit: it changes the tactic
+        # choice, not the result, so it is not part of the tag.
+        workspace = self.args.workspace_mb or os.environ.get("DA_TRT_WORKSPACE_MB")
+        if workspace:
+            flags = apply_workspace(flags, workspace)
+            info(f"[{cname}] workspace limit {workspace} MiB (override)")
         cmd = [trtexec, f"--onnx={self.vdir / comp['source']}", f"--saveEngine={tmp}", *flags]
         info(f"[{cname}] build: {' '.join(shlex.quote(c) for c in cmd)}")
         t0 = time.time()
@@ -966,7 +978,8 @@ class Builder:
         check_engine_io(tmp, comp)
         digest = sha256_file(tmp)
         m = self.meta(cname, comp, tag, digest, tmp.stat().st_size, "trtexec",
-                      {"trtexec_flags": comp.get("trtexec_flags", ""), "build_seconds": round(time.time() - t0, 1)})
+                      {"trtexec_flags": comp.get("trtexec_flags", ""), "trtexec_args": cmd[3:],
+                       "build_seconds": round(time.time() - t0, 1)})
         os.replace(tmp, engine)
         write_json(meta_path, m)
         info(f"[{cname}] built {engine} in {m['build_seconds']} s")
@@ -1451,6 +1464,9 @@ def main(argv=None):
     s.add_argument("--no-upload", action="store_true", help="do not upload to the engine cache")
     s.add_argument("--rebuild", action="store_true", help="build again with trtexec, ignore all caches")
     s.add_argument("--require-upload", action="store_true", help="fail when the upload fails (not on denial)")
+    s.add_argument("--workspace-mb", type=int, metavar="MIB",
+                   help="TensorRT builder workspace limit (default: from models.yaml; "
+                        "or $DA_TRT_WORKSPACE_MB). Use on low-memory devices.")
 
     s = sub.add_parser("verify", parents=[common], help="check the local store (and the bucket)")
     s.add_argument("ref", nargs="?", help="<model> or <model>@<version> (default: all)")
