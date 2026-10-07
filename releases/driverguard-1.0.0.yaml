@@ -27,6 +27,8 @@ files:
   - {name: dtcp_v1_control.onnx, path: ~/model/jetson_bundle/onnx/dtcp_v1_control.onnx}
   - {name: bundle_manifest.json, path: ~/model/jetson_bundle/MANIFEST.json}
   - {name: reference_dtcp_pc.json, path: ~/model/jetson_bundle/samples/reference_dtcp_pc.json}
+  # Made by da-models deterministic_targz from ~/model/jetson_bundle/samples (3 frames + manifest + references).
+  - {name: validation_samples.tar.gz, path: ~/.cache/da-models-staging/driverguard-1.0.0/validation_samples.tar.gz}
 components:
   yolopx:
     runtime: tensorrt
