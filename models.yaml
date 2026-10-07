@@ -186,3 +186,85 @@ models:
             throttle_mae_max: 0.02
             steer_mae_max: 0.02
             reference: reference_dtcp_pc.json
+  system1:
+    description: System 1 trajectory model (ConvNeXt V2 Tiny + factorized trajectory scorer, 47.6M params).
+      Runs in PyTorch with bf16 autocast and two custom CUDA ops.
+    versions:
+      1.0.0:
+        status: candidate
+        published_at: '2026-10-07T08:27:37Z'
+        published_by: da-models-publisher@ancient-binder-127813.iam.gserviceaccount.com
+        upstream:
+          model_version: v9e
+          epoch: 12
+        notes: Candidate until the Phase 3 smoke test on demo passes. fp16 autocast gives NaN in heading_head;
+          use bf16. The custom ops (deformable_aggregation) are compiled on the target by `da-models build`.
+        requires:
+          jetpack_min: '6.1'
+          torch_min: '2.8'
+          python:
+            timm: ==1.0.26
+        tested_with:
+          device: agxorin64
+          l4t: 36.4.7
+          jetpack: 6.2.1
+          cuda: 12.6.11
+          tensorrt: 10.3.0
+          torch: 2.8.0
+          onnxruntime: 1.23.2
+          python:
+            timm: 1.0.26
+        runtime:
+          file: runtime.tar.gz
+          git_repo: git@github.com:osmosishk/driveragent-models.git
+          git_commit: 225018c5771eb84ab30adbdd4faaeae9974a4a9a
+          git_subdir: runtime/system1
+        files:
+        - name: system1_deploy.pth
+          size: 252337287
+          sha256: a5629a5e0f8ae074b91abb2137166ba9607a5653ab381a4ccdd10cf8994d8ec7
+        - name: runtime.tar.gz
+          size: 39850
+          sha256: 90058cb7faa1aa9451adbb138b6efd693395b6dc1d1536c6b39dd4106506b3ea
+        components:
+          system1:
+            runtime: pytorch
+            source: system1_deploy.pth
+            precision: bf16
+            inputs:
+            - name: images
+              shape: [1, 6, 3, 256, 704]
+              dtype: float32
+            - name: ego_state
+              shape: [1, 8]
+              dtype: float32
+            - name: projection_mat
+              shape: [1, 6, 4, 4]
+              dtype: float32
+            - name: image_wh
+              shape: [1, 6, 2]
+              dtype: float32
+            outputs:
+            - name: trajectory
+              shape: [1, 6, 3]
+              dtype: float32
+            build:
+              dir: runtime/system1/ops
+              command: python3 setup.py build_ext --inplace
+              artifacts:
+              - deformable_aggregation_ext*.so
+              - deformable_aggregation_with_depth_ext*.so
+              cache_file: ops-build.tar.gz
+        preprocessing:
+          cameras: 6 (cam0..cam5); intrinsics/extrinsics come from the vehicle calibration, not from the
+            registry
+          normalize:
+            mean: [0.485, 0.456, 0.406]
+            std: [0.229, 0.224, 0.225]
+          final_size: [256, 704]
+          checkpoint_record:
+            resize: 0.44
+            crop: top
+            raw_size: [900, 1600]
+        postprocessing:
+          trajectory: 6 waypoints (x, y, heading) in the ego frame
