@@ -144,8 +144,35 @@ extracts it into `<root>/<model>/<version>/runtime/`.
 |---|---|---|
 | `runtime/driverguard/` | `run.py`, `runner/`, `jetson_runtime/`, `validate_jetson.py`, docs | Osmosis code (from `~/model/driverguard`, `~/model/jetson_bundle` on `demo`) |
 | `runtime/system1/system1/` | System 1 package, custom CUDA ops source | Osmosis code (from `~/model/system1`) |
-| `runtime/system1/models_convnext/`, `runtime/system1/models/backbone.py` | ConvNeXt V2 backbone (uses timm); FPN and GridMask that it loads by file path | From `~/model/sparsedrive/models_convnext` and `~/model/sparsedrive/models/backbone.py` on `demo`. **Upstream URL and commit: unknown.** The folder has no git data and no LICENSE file. |
+| `runtime/system1/models_convnext/`, `runtime/system1/models/backbone.py` | ConvNeXt V2 backbone (uses timm); FPN and GridMask that it loads by file path | From `~/model/sparsedrive` on `demo`. **No upstream counterpart** in https://github.com/swc-17/SparseDrive (upstream uses an mmdet3d ResNet backbone). Treat as Osmosis code. |
 | `runtime/yolopx/` | `lib/`, `tools/demotext.py`, `LICENSE` | https://github.com/jiaoZ7688/YOLOPX, commit `35627f645ef84baee93eef33283b807c42da77d3` (MIT, see `runtime/yolopx/LICENSE`). `tools/demotext.py` is a local addition. |
+
+### SparseDrive upstream (compared 2026-10-07)
+
+Upstream: https://github.com/swc-17/SparseDrive, MIT License, Copyright (c)
+2024 swc-17. A copy of the upstream LICENSE is in
+`runtime/system1/LICENSE.SparseDrive` (unchanged since commit `ffebeb4`).
+
+Only the System 1 custom CUDA ops come from upstream
+`projects/mmdet3d_plugin/ops/`. Line similarity to the nearest upstream file:
+
+| Local file (`runtime/system1/system1/ops/`) | Upstream file | Similarity |
+|---|---|---|
+| `src/deformable_aggregation_cuda.cu` | `src/deformable_aggregation_cuda.cu` | 0.72 |
+| `setup.py` | `setup.py` | 0.72 |
+| `src/deformable_aggregation.cpp` | `src/deformable_aggregation.cpp` | 0.64 |
+| `src/deformable_aggregation_with_depth.cpp` | `src/deformable_aggregation.cpp` | 0.54 |
+| `deformable_aggregation.py` | `__init__.py` | 0.37 (partly) |
+
+Nearest commit: the upstream code of these files is the same in all commits
+from `ffebeb4` (2024-06-24, "release") to `ec0225d` (2026-04-01). The local
+files are dated 2026-05-07, so the nearest commit is **`ec0225d`** (exact base
+commit unknown). Local changes: THC atomics replaced by ATen
+(`ATen/cuda/Atomic.cuh`), changed kernel indexing (no `num_anchors`), a new
+`deformable_aggregation_with_depth` extension, and `setup.py` builds both.
+The upstream fix `4958e1e` (2026-09-15, large-batch indexing) is **not** in the
+local code. Other System 1 files (`scorer/`, `models/`, `models_convnext/`) have
+no upstream match (similarity 0.37 or less).
 
 Commit `4ff9985` is a byte-identical copy of the code on `demo`. Later commits
 change the code. The services on `demo` still use the old folders; wiring them
