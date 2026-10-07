@@ -6,15 +6,24 @@ key on these units.
 
 ## 1. Check the base system
 
-1. Make sure that the unit has JetPack 6.1 or later. JetPack 6.2.1 is the
-   tested version.
+1. Find the JetPack and TensorRT versions. They select the DriverGuard
+   version:
    ```
-   cat /etc/nv_tegra_release           # R36 (release), REVISION: 4.x
-   ls /usr/src/tensorrt/bin/trtexec    # must exist
-   python3 -c "import tensorrt; print(tensorrt.__version__)"   # 10.3 or later
+   cat /etc/nv_tegra_release           # R36 (release), REVISION: x.y
+   ls /usr/src/tensorrt/bin/trtexec    # must exist (not on PATH)
+   python3 -c "import tensorrt; print(tensorrt.__version__)"
    ```
+
+   | L4T | JetPack | TensorRT | DriverGuard version |
+   |---|---|---|---|
+   | R36.4.x | 6.1 / 6.2.x | 10.3 | `driverguard@1.0.0` (production) |
+   | R36.3.0 | 6.0 | 8.6.2 | `driverguard@1.0.1` (candidate, TensorRT 8.6 variant) |
+
+   The engine tag contains the TensorRT version, so engines for TensorRT 8.6
+   and 10.3 never mix in the cache.
 2. If `trtexec` or `tensorrt` is missing, install the JetPack packages:
-   `sudo apt install nvidia-jetpack`.
+   `sudo apt install nvidia-jetpack`. Do not do this on a unit that another
+   team owns without their approval.
 
 ## 2. Install the tool
 
@@ -25,11 +34,39 @@ key on these units.
    ```
    git clone git@github.com:osmosishk/driveragent-models.git ~/driveragent-models
    ```
-3. Install the Python packages. Use PyPI only (the NVIDIA extra index in the
-   default pip.conf can fail):
+   **If the unit has no GitHub key yet** (as on `orin-nx`), push the repo from
+   `demo` over SSH (only `~/driveragent-models` changes on the unit):
    ```
-   PIP="pip3 install --user --isolated --index-url https://pypi.org/simple"
-   $PIP google-cloud-storage pyyaml onnxruntime
+   # on the unit:
+   git init -q -b main ~/driveragent-models
+   git -C ~/driveragent-models config receive.denyCurrentBranch updateInstead
+   # on demo:
+   GIT_SSH_COMMAND="ssh -i ~/.ssh/<key>" git push ssh://<user>@<unit>/home/<user>/driveragent-models main
+   # on the unit:
+   git -C ~/driveragent-models config --unset receive.denyCurrentBranch
+   git -C ~/driveragent-models remote add origin git@github.com:osmosishk/driveragent-models.git
+   ```
+   To update `models.yaml` by itself later (`git -C ~/driveragent-models pull`),
+   the unit needs a read-only GitHub deploy key.
+3. Install the Python packages that the manifest requires, **one at a time,
+   without dependencies**, so that pip cannot change torch, numpy or other
+   packages. Use PyPI only (the NVIDIA extra index can fail), and no cache:
+   ```
+   PIP="pip3 install --user --isolated --index-url https://pypi.org/simple --no-cache-dir --no-deps"
+   ```
+   Check first which packages are missing (`python3 -c "import importlib.metadata as m; print(m.version('<pkg>'))"`).
+   The DriverGuard runtime and `da-models` need: `tensorrt` (JetPack), `pycuda`,
+   `onnxruntime`, `cv2`, `numpy`, `zmq`, `capnp`, `yaml`, `google-cloud-storage`.
+   Set used on `orin-nx` (JetPack 6.0), in this order:
+   ```
+   for p in humanfriendly==10.0 coloredlogs==15.0.1 flatbuffers==25.12.19 onnxruntime==1.23.2 \
+            platformdirs==4.12.3 siphash24==1.9 pytools==2026.1.1; do
+     $PIP --only-binary=:all: "$p"
+   done
+   # pycuda has no aarch64 wheel: it compiles (about 2 min on Orin NX). nvcc is not on PATH on JetPack 6.0.
+   tmux new-session -d -s da-pycuda "export PATH=/usr/local/cuda/bin:\$PATH CUDA_ROOT=/usr/local/cuda; \
+     nice -n 19 $PIP --no-build-isolation --no-binary pycuda pycuda==2026.1 > ~/handoff/logs/pycuda-build.log 2>&1"
+   python3 -c "import pycuda.driver as d; d.init(); print(d.Device(0).name())"
    ```
 4. For System 1 only: PyTorch 2.8 for JetPack 6 must already be installed.
    Install timm **without dependencies**, so that pip cannot change torch:
@@ -122,8 +159,10 @@ Use `--rate 5` for DriverGuard on an Orin NX until a real unit is measured.
 
 ### Measure on the unit
 
-Orin NX 16 GB with JetPack 6.2 (L4T 36.4.3, TensorRT 10.3) gets the tag
-`orinnx16-jp6.2-trt10.3.0-<precision>`. Check it with `./da-models device`.
+The tag comes from the unit: for example `orin-nx` (Orin NX 16 GB, JetPack 6.0,
+TensorRT 8.6.2) gets `orinnx16-jp6.0-trt8.6.2-<precision>`, and an Orin NX with
+JetPack 6.2 would get `orinnx16-jp6.2-trt10.3.0-<precision>`. Check it with
+`./da-models device`.
 
 ```
 sudo jetson_clocks                                   # fixed clocks: DVFS changes the figures
