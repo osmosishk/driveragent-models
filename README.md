@@ -151,7 +151,7 @@ extracts it into `<root>/<model>/<version>/runtime/`.
 
 Upstream: https://github.com/swc-17/SparseDrive, MIT License, Copyright (c)
 2024 swc-17. A copy of the upstream LICENSE is in
-`runtime/system1/LICENSE.SparseDrive` (unchanged since commit `ffebeb4`).
+`runtime/system1/LICENSE.SparseDrive` (unchanged since commit `4300304`, the first commit).
 
 Only the System 1 custom CUDA ops come from upstream
 `projects/mmdet3d_plugin/ops/`. Line similarity to the nearest upstream file:
