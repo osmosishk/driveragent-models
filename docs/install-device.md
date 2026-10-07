@@ -146,7 +146,19 @@ free -h                   # make sure that swap (zram) is on
 The 1024 MiB workspace was tested on `demo`: same outputs (masks 100 % equal,
 same controls), yolopx same rate, dtcp_main 9.5 % slower.
 
-### Fit and rate (estimates from demo measurements; confirm on a real unit)
+### Measured on orin-nx (Orin NX 16 GB, JetPack 6.0, TensorRT 8.6), 2026-10-07
+
+| Item | Measured |
+|---|---|
+| DriverGuard 1.0.1 full frame (JPEG 1600x900) | 114.4 ms (8.7 Hz); about 98 ms without JPEG decode |
+| Memory | 570 MB process RSS; build peak 8.9 GB system RAM (HMI included) |
+| Build time (workspace 4096 MiB) | YOLOPX 23.7 min, DTCP main 53 s; cache download 4 s |
+| Validation | PASS, throttle MAE 0.0018, steer MAE 0.0022 |
+
+Details: `docs/validation-orinnx-2026-10-07.md`. Use `--rate 8` for DriverGuard
+on an Orin NX 16 GB until a live run is measured.
+
+### Fit and rate (estimates from demo measurements, before the real unit)
 
 | Model | Memory | Orin NX 16 GB | Orin NX 8 GB |
 |---|---|---|---|
@@ -155,7 +167,7 @@ same controls), yolopx same rate, dtcp_main 9.5 % slower.
 | System 1 1.0.1 | 3.3 GB RSS + 1.1 GB CUDA | fits | **does not fit** with DriverGuard and the OS |
 | System 1 rate (default 5 Hz) | demo: 212 ms (4.7 Hz), already below 5 Hz | about 470-720 ms (1.4-2.1 Hz): **too slow** | not applicable |
 
-Use `--rate 5` for DriverGuard on an Orin NX until a real unit is measured.
+The DriverGuard estimate for the Orin NX 16 GB was pessimistic (see the measured table above). The Orin NX 8 GB and System 1 rows are still estimates.
 
 ### Measure on the unit
 
