@@ -90,3 +90,56 @@ model cannot load.
 Builds with TensorRT 10.3 FP16 in 601 s; 6x3x256x704 input; GPU compute
 60.8 ms (16.4 qps). Not compared numerically (no engine in use). The engine is
 not uploaded.
+
+## 4. Backbone candidate vs PyTorch backbone (same input)
+
+Input: 6 views (3 nuScenes front frames + mirror images), System 1
+preprocessing, values in [0, 1] (the ONNX graph normalizes at its input).
+
+| FPN level | Cosine TRT FP16 vs torch FP32 | Min per camera | Cosine torch bf16 vs FP32 |
+|---|---|---|---|
+| 0 (64x176) | 0.968 | 0.967 | 0.99998 |
+| 1 (32x88) | 0.975 | 0.974 | 0.99998 |
+| 2 (16x44) | 0.974 | 0.973 | 0.99998 |
+| 3 (8x22) | 0.937 | 0.936 | 0.99999 |
+
+Trajectory with the TRT backbone + bf16 scorer vs production (torch bf16
+backbone + bf16 scorer): last waypoint **1.29 m** apart, headings differ in
+sign. Production vs FP32 features: 0.06 max. Result: the candidate backbone
+is **not usable**. Cause: GroupNorm in place of LayerNorm in the export.
+
+## 5. System 1 time split (bf16, raw 6x1600x900 uint8 -> trajectory)
+
+| Stage | Mean | p95 |
+|---|---|---|
+| Preprocess (CPU resize + normalize, copy to GPU) | 46.5 ms | 60.4 ms |
+| Backbone (ConvNeXt V2 Tiny + FPN) | 102.3 ms | 102.9 ms |
+| Scorer head | 115.8 ms | 117.1 ms |
+| Postprocess (to CPU) | 0.1 ms | 0.2 ms |
+| Total | 264.8 ms | 278.2 ms |
+
+GPU clock 1224-1300 MHz during the run. The earlier 212 ms figure is
+backbone + head only (input already a tensor). TRT backbone (candidate):
+61.0 ms.
+
+## 6. DriverGuard time split (nuScenes frame 1600x900, rebuilt engines)
+
+| Stage | Mean | p95 | In the 108 ms loop |
+|---|---|---|---|
+| Decode JPEG | 21.7 ms | 26.6 ms | no |
+| YOLOPX preprocess (letterbox, normalize) | 19.3 ms | 22.0 ms | yes |
+| YOLOPX H2D / compute / D2H | 1.2 / 29.8 / 2.0 ms | 1.6 / 33.1 / 2.4 ms | yes |
+| YOLOPX NMS + box scale | 1.2 ms | 1.8 ms | no |
+| YOLOPX masks (un-pad, resize) | 5.0 ms | 5.8 ms | no |
+| DTCP preprocess (incl. BGR->RGB) | 13.2 ms | 17.0 ms | yes |
+| DTCP H2D / compute / D2H | 1.8 / 26.0 / 0.5 ms | 2.1 / 31.9 / 0.6 ms | yes |
+| Control: ORT mu/sigma | 2.4 ms | 7.0 ms | yes |
+| Control: beta mode | 0.2 ms | 0.2 ms | yes |
+| DTCP postprocess (steer, speed) | 0.02 ms | 0.02 ms | no |
+| Sum of the "yes" stages | 96.2 ms | | |
+| Full frame | 124.1 ms | | |
+
+GPU compute in this loop (29.8 + 26.0 ms) is about 3x the trtexec figure
+(8.7 + 8.0 ms): DVFS keeps the GPU at 306-408 MHz in this loop (1300 MHz in
+trtexec), and the CPU at 0.7-1.6 GHz (max 2.2 GHz). Fixed clocks
+(`jetson_clocks`, needs sudo) were not tested.
