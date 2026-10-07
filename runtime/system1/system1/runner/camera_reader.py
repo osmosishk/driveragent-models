@@ -1,6 +1,6 @@
 """6-camera GStreamer reader for /tmp/cam0..cam5 (RGBA 1280x720 @ 30fps).
 
-Adapted from /home/tonyho/model/sparsedrive/run/camera_integration.py.
+Adapted from ~/model/sparsedrive/run/camera_integration.py on host demo.
 Returns a torch.uint8 tensor [6, 3, H, W] in RGB order (alpha dropped).
 """
 

@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-CALIB_DIR_DEFAULT = "/home/tonyho/driveragent/calibration"
+CALIB_DIR_DEFAULT = os.path.join(os.path.expanduser(os.environ.get("DRIVERAGENT_ROOT", "~/driveragent")), "calibration")
 NUM_CAMERAS = 6
 
 # Stream resolution out of /tmp/cam* (RGBA from camtest). cam*.yaml is calibrated

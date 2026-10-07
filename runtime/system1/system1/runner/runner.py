@@ -1,6 +1,6 @@
 """System1 main runner: cameras → preprocess → inference → ZMQ publish.
 
-Invoked through /home/tonyho/model/system1/run.py, which puts both the system1
+Invoked through <version>/runtime/system1/run.py, which puts both the system1
 root and the driveragent root on sys.path before calling main(args).
 """
 
@@ -19,10 +19,12 @@ from runner.camera_reader import GStreamerCameraReader
 from runner.calibration import load_all as load_calibration
 from runner.ego_state import EgoStateProvider, CMD_STRAIGHT
 
-DEFAULT_SCHEMA = "/home/tonyho/driveragent/message/message.capnp"
+DEFAULT_SCHEMA = os.path.join(os.path.expanduser(os.environ.get("DRIVERAGENT_ROOT", "~/driveragent")), "message", "message.capnp")
 DEFAULT_PUB_ADDR = "tcp://*:8011"
 DEFAULT_SD_STATUS_ADDR = "tcp://127.0.0.1:5595"
-DEFAULT_CHECKPOINT = "/home/tonyho/model/system1/system1_deploy.pth"
+# <version>/system1_deploy.pth (this file is <version>/runtime/system1/runner/runner.py)
+DEFAULT_CHECKPOINT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))), "system1_deploy.pth")
 SERVICE_NAME = "system1_runner"
 
 
@@ -34,7 +36,7 @@ def _import_system1():
     except ImportError as e:
         msg = (
             f"Cannot import run_system1: {e}\n"
-            f"Expected /home/tonyho/model/system1/run_system1.py on sys.path.\n"
+            f"Expected <version>/runtime/system1/run_system1.py on sys.path.\n"
             f"Per DEPLOY_INSTRUCTIONS.md Step 2, copy these from the training server:\n"
             f"  system1/{{__init__.py, config.py, system1_model.py, scorer/...}}\n"
             f"  models_convnext/backbone.py\n"
@@ -323,5 +325,5 @@ def main(args):
 if __name__ == "__main__":
     raise SystemExit(
         "Do not run runner/runner.py directly. "
-        "Use: python /home/tonyho/model/system1/run.py [--checkpoint ...]"
+        "Use: python <version>/runtime/system1/run.py [--checkpoint ...]"
     )

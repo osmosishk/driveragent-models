@@ -8,6 +8,7 @@ assume forward motion (vy=0, yaw_rate=0) and derive longitudinal accel from
 finite differences of speed.
 """
 
+import os
 import sys
 import time
 import threading
@@ -15,10 +16,11 @@ import threading
 import torch
 
 # Allow running both as a package module and as a script
-sys.path.insert(0, "/home/tonyho/driveragent")
+DRIVERAGENT_ROOT = os.path.expanduser(os.environ.get("DRIVERAGENT_ROOT", "~/driveragent"))
+sys.path.insert(0, DRIVERAGENT_ROOT)
 from message.capnp_pubsub import Subscriber
 
-CAPNP_SCHEMA = "/home/tonyho/driveragent/message/message.capnp"
+CAPNP_SCHEMA = os.path.join(DRIVERAGENT_ROOT, "message", "message.capnp")
 CARSTATE_ADDR = "tcp://127.0.0.1:5592"
 
 # Turn-intent one-hot encoding used by System1 ego_state[6:8]

@@ -3,8 +3,8 @@
 Spawns the system1 inference daemon. Mirrors yolopx's tools/demotext.py shape
 so the UI/supervisor can launch any model with the same calling convention:
 
-    python /home/tonyho/model/system1/run.py \
-        --checkpoint /home/tonyho/model/system1/system1_deploy.pth \
+    python <version>/runtime/system1/run.py \
+        --checkpoint <version>/system1_deploy.pth \
         --rate 5 --pub-port 8011
 
 The driveragent root is added to sys.path here so the runner can import
@@ -16,9 +16,10 @@ import argparse
 import os
 import sys
 
-SYSTEM1_ROOT = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DRIVERAGENT_ROOT = "/home/tonyho/driveragent"
-DEFAULT_CHECKPOINT = os.path.join(SYSTEM1_ROOT, "system1_deploy.pth")
+SYSTEM1_ROOT = os.path.dirname(os.path.abspath(__file__))       # <version>/runtime/system1
+MODEL_DIR = os.path.dirname(os.path.dirname(SYSTEM1_ROOT))       # <version>
+DEFAULT_DRIVERAGENT_ROOT = os.path.expanduser(os.environ.get("DRIVERAGENT_ROOT", "~/driveragent"))
+DEFAULT_CHECKPOINT = os.path.join(MODEL_DIR, "system1_deploy.pth")
 DEFAULT_SCHEMA = os.path.join(DEFAULT_DRIVERAGENT_ROOT, "message", "message.capnp")
 
 
