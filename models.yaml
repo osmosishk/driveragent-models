@@ -268,3 +268,63 @@ models:
             raw_size: [900, 1600]
         postprocessing:
           trajectory: 6 waypoints (x, y, heading) in the ego frame
+  system1-backbone:
+    description: Experimental ONNX export of the System 1 ConvNeXt V2 backbone (for a later TensorRT backbone
+      + PyTorch scorer pipeline). Not used by System 1 1.0.0.
+    versions:
+      0.1.0:
+        status: candidate
+        published_at: '2026-10-07T08:27:44Z'
+        published_by: da-models-publisher@ancient-binder-127813.iam.gserviceaccount.com
+        upstream:
+          model_version: v9e
+          epoch: 12
+        notes: LayerNorm is replaced by GroupNorm to avoid a TensorRT Transpose fusion failure. This is
+          not numerically exact (cosine similarity about 0.95-0.97).
+        requires:
+          jetpack_min: '6.1'
+          tensorrt_min: '10.3'
+        tested_with:
+          device: agxorin64
+          l4t: 36.4.7
+          jetpack: 6.2.1
+          cuda: 12.6.11
+          tensorrt: 10.3.0
+          torch: 2.8.0
+          onnxruntime: 1.23.2
+        files:
+        - name: backbone_nchw.onnx
+          size: 1342722
+          sha256: a31813fca8a29d1facacb39d0e1e57e76d38552685a1dbd2220291c5cc6f490c
+        - name: backbone_nchw.onnx.data
+          size: 122421248
+          sha256: 2c3b8e051e878f464322950a447fb98fafc4e7e38a27b15eee981ac0f93429c6
+        components:
+          backbone:
+            runtime: tensorrt
+            source: backbone_nchw.onnx
+            precision: fp16
+            engine: backbone_nchw.engine
+            trtexec_flags: --fp16 --memPoolSize=workspace:4096 --shapes=images:6x3x256x704
+            inputs:
+            - name: images
+              shape: [6, 3, 256, 704]
+              dtype: float32
+            outputs:
+            - name: feat_0
+              shape: [6, 256, 64, 176]
+              dtype: float32
+            - name: feat_1
+              shape: [6, 256, 32, 88]
+              dtype: float32
+            - name: feat_2
+              shape: [6, 256, 16, 44]
+              dtype: float32
+            - name: feat_3
+              shape: [6, 256, 8, 22]
+              dtype: float32
+        preprocessing:
+          normalize:
+            mean: [0.485, 0.456, 0.406]
+            std: [0.229, 0.224, 0.225]
+          final_size: [256, 704]
