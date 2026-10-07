@@ -119,3 +119,18 @@ same controls), yolopx same rate, dtcp_main 9.5 % slower.
 | System 1 rate (default 5 Hz) | demo: 212 ms (4.7 Hz), already below 5 Hz | about 470-720 ms (1.4-2.1 Hz): **too slow** | not applicable |
 
 Use `--rate 5` for DriverGuard on an Orin NX until a real unit is measured.
+
+### Measure on the unit
+
+Orin NX 16 GB with JetPack 6.2 (L4T 36.4.3, TensorRT 10.3) gets the tag
+`orinnx16-jp6.2-trt10.3.0-<precision>`. Check it with `./da-models device`.
+
+```
+sudo jetson_clocks                                   # fixed clocks: DVFS changes the figures
+python3 tools/bench_driverguard.py                   # time split, ms
+python3 tools/bench_system1.py --model-dir /opt/driveragent/models/system1/1.0.1
+python3 tools/live_rate.py --seconds 600             # when the models run on live data
+```
+
+On `demo`, DVFS lowered the GPU to 306-408 MHz (max 1300 MHz) during the
+DriverGuard loop. Report whether `jetson_clocks` was on with each result.
